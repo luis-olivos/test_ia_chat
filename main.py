@@ -18,7 +18,7 @@ from dotenv import load_dotenv
 
 # Configuration constants controlled by environment variables for flexibility.
 # Carga las variables del archivo .env
-load_dotenv()
+load_dotenv()#
 # ---------------------------------------------------------------------------
 # Configuración general
 # ---------------------------------------------------------------------------
