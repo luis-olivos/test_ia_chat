@@ -50,6 +50,11 @@ qa_chain: RetrievalQA | None = None
 ConversationHistory = List[Tuple[str, str]]
 conversation_histories: Dict[Tuple[str, str], ConversationHistory] = {}
 
+# Número máximo de turnos previos que se incluirán al condensar el historial
+# de chat. Mantenerlo acotado evita que el prompt crezca sin control mientras
+# conserva suficiente contexto para referencias recientes.
+MAX_HISTORY_TURNS = 3
+
 
 class AskRequest(BaseModel):
     """Schema for incoming POST /ask requests."""
@@ -171,7 +176,7 @@ def initialize_qa_chain() -> RetrievalQA:
     prompt = PromptTemplate(
         template=(
             """📋 Instrucciones:
-            - Usa únicamente HTML básico: <h2>, <p>, <ul>, <li>, <strong>.  
+            - Usa únicamente HTML básico: <h2>, <p>, <ul>, <li>, <strong>.
             - No incluyas estilos en línea ni enlaces.
             - Estructura tus respuestas así:
             1. Un <p> inicial con la explicación principal (máximo 3 líneas).
@@ -185,12 +190,15 @@ def initialize_qa_chain() -> RetrievalQA:
             - Si la respuesta requiere información extensa, **resume solo lo esencial** (máximo 5 líneas de texto total).
             - No cites todo el documento ni fragmentos largos.
             - No uses frases como “según la información proporcionada” ni “de acuerdo al contexto”.
-            
+
+            Historial reciente de la conversación (usuario → asistente):
+            {chat_history_text}
+
             "Contexto disponible:\n{context}\n\n"
             "Pregunta del usuario: {question}\n\n"
             "Respuesta en HTML:"""
         ),
-        input_variables=["context", "question"],
+        input_variables=["context", "question", "chat_history_text"],
     )
 
     # Build a retriever from the vector store to be consumed by LangChain's RetrievalQA chain.
@@ -207,6 +215,20 @@ def initialize_qa_chain() -> RetrievalQA:
         return_source_documents=True,
         chain_type_kwargs={"prompt": prompt},
     )
+
+
+def summarize_chat_history(chat_history: ConversationHistory, max_turns: int = MAX_HISTORY_TURNS) -> str:
+    """Condense the chat history into a short textual summary for the prompt."""
+
+    if not chat_history:
+        return "(sin historial previo)"
+
+    relevant_turns = chat_history[-max_turns:]
+    lines: List[str] = []
+    for idx, (question, answer) in enumerate(relevant_turns, start=1):
+        lines.append(f"Turno {idx} - Usuario: {question}")
+        lines.append(f"Turno {idx} - Asistente: {answer}")
+    return "\n".join(lines)
 
 
 @app.on_event("startup")
@@ -247,7 +269,15 @@ def ask_question(payload: AskRequest) -> AskResponse:
     # El objeto ``qa_chain`` se comporta como una función: recibe un diccionario
     # con la clave "query" y devuelve otro diccionario que incluye la respuesta
     # generada y los documentos relevantes.
-    result = qa_chain({"query": payload.question, "chat_history": chat_history})
+    chat_history_text = summarize_chat_history(chat_history)
+
+    result = qa_chain(
+        {
+            "query": payload.question,
+            "chat_history": chat_history,
+            "chat_history_text": chat_history_text,
+        }
+    )
     answer = result.get("result", "No answer generated.")
 
     source_docs = result.get("source_documents", [])

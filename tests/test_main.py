@@ -118,11 +118,18 @@ class DummyDoc:
 class DummyChain:
     def __init__(self):
         self.calls = []
+        self.handler = None
 
     def __call__(self, query):
         self.calls.append(query)
+        if self.handler is not None:
+            return self.handler(query)
+        return self.default_result("dummy answer")
+
+    @staticmethod
+    def default_result(answer):
         return {
-            "result": "dummy answer",
+            "result": answer,
             "source_documents": [
                 DummyDoc("content A", {"source": "file1.pdf", "page": 1}),
                 DummyDoc("content A", {"source": "file1.pdf", "page": 1}),
@@ -178,6 +185,39 @@ def test_conversation_history_is_tracked_per_user(test_client):
 
     calls = main._dummy_chain.calls  # type: ignore[attr-defined]
     assert calls[0]["chat_history"] == []
+    assert calls[0]["chat_history_text"] == "(sin historial previo)"
     assert calls[1]["chat_history"] == [("First?", "dummy answer")]
+    assert "Turno 1 - Usuario: First?" in calls[1]["chat_history_text"]
     # A different usuario must not receive the previous history.
     assert calls[2]["chat_history"] == []
+    assert calls[2]["chat_history_text"] == "(sin historial previo)"
+
+
+def test_follow_up_question_uses_chat_history(test_client):
+    chain = main._dummy_chain  # type: ignore[attr-defined]
+
+    def handler(query):
+        if query["query"] == "¿De qué color es el cielo?":
+            return chain.default_result("El cielo es azul.")
+
+        assert query["query"] == "¿De qué color es?"
+        assert "El cielo es azul." in query["chat_history_text"]
+        return chain.default_result("Es azul.")
+
+    chain.handler = handler
+
+    response1 = test_client.post(
+        "/ask",
+        json={"question": "¿De qué color es el cielo?", "user_id": "u1", "conversation_id": "hist"},
+    )
+    assert response1.status_code == 200
+
+    response2 = test_client.post(
+        "/ask",
+        json={"question": "¿De qué color es?", "user_id": "u1", "conversation_id": "hist"},
+    )
+    assert response2.status_code == 200
+
+    assert response2.json()["answer"] == "Es azul."
+
+    chain.handler = None
