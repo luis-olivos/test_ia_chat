@@ -10,6 +10,7 @@ from pydantic import BaseModel
 
 from langchain_classic.chains import RetrievalQA
 from langchain_core.documents import Document
+from langchain_core.prompts import PromptTemplate
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
@@ -148,6 +149,25 @@ def initialize_qa_chain() -> RetrievalQA:
     # en las respuestas (valores bajos = respuestas más deterministas).
     llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.2)
 
+    # Prompt específico para guiar al modelo en el formato requerido por el
+    # frontend. El ``PromptTemplate`` se integra con LangChain y recibe el
+    # contexto recuperado y la pregunta original.
+    prompt = PromptTemplate(
+        template=(
+            "Eres un asistente servicial. Debes responder en español y ser claro y amable.\n"
+            "Usa únicamente HTML básico (<h2>, <p>, <ul>, <li>, <strong>) sin estilos en línea.\n"
+            "Estructura la respuesta siguiendo este formato: \n"
+            "- Un <p> con la explicación principal breve.\n"
+            "- Si aplica, una lista con <ul> y <li> para pasos o puntos clave.\n"
+            "- Finaliza con un <p> citando el manual o fuente de la información.\n"
+            "Incluye la información de las fuentes usando los metadatos proporcionados.\n\n"
+            "Contexto disponible:\n{context}\n\n"
+            "Pregunta del usuario: {question}\n\n"
+            "Respuesta en HTML:"
+        ),
+        input_variables=["context", "question"],
+    )
+
     # Build a retriever from the vector store to be consumed by LangChain's RetrievalQA chain.
     # Un "retriever" se encarga de buscar los fragmentos más relevantes dentro
     # del índice vectorial dado un texto de consulta.
@@ -160,6 +180,7 @@ def initialize_qa_chain() -> RetrievalQA:
         llm=llm,
         retriever=retriever,
         return_source_documents=True,
+        chain_type_kwargs={"prompt": prompt},
     )
 
 
