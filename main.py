@@ -136,11 +136,30 @@ def ask_question(payload: AskRequest) -> AskResponse:
 
     source_docs = result.get("source_documents", [])
     context_snippets = []
+    seen_sources = set()
     for doc in source_docs:
         metadata = doc.metadata or {}
         source = metadata.get("source", "unknown source")
-        page = metadata.get("page", "?")
-        snippet = f"Source: {source} (page {page})\n{doc.page_content.strip()}"
+        page = metadata.get("page")
+
+        # Normalize the snippet content so duplicates can be filtered reliably.
+        page_content = (doc.page_content or "").strip()
+
+        # Use the page information when available; otherwise fall back to the
+        # combination of source and content to avoid losing distinct snippets
+        # that originate from the same file but different sections.
+        if page in (None, ""):
+            dedupe_key = (source, page_content)
+            page_display = "?"
+        else:
+            dedupe_key = (source, page)
+            page_display = page
+
+        if dedupe_key in seen_sources:
+            continue
+        seen_sources.add(dedupe_key)
+
+        snippet = f"Source: {source} (page {page_display})\n{page_content}"
         context_snippets.append(snippet)
 
     return AskResponse(answer=answer, context=context_snippets)
