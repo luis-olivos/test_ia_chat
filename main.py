@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import glob
 import os
-from typing import List
+from typing import Dict, List, Tuple
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -44,6 +44,12 @@ app = FastAPI(title="PDF Question Answering API")
 # tubería de LangChain en cada petición HTTP, lo que reduciría el rendimiento.
 qa_chain: RetrievalQA | None = None
 
+# Diccionario en memoria que conserva el historial de cada combinación
+# usuario/conversación. La clave es una tupla ``(user_id, conversation_id)`` y
+# el valor es una lista de pares ``(pregunta, respuesta)`` en orden cronológico.
+ConversationHistory = List[Tuple[str, str]]
+conversation_histories: Dict[Tuple[str, str], ConversationHistory] = {}
+
 
 class AskRequest(BaseModel):
     """Schema for incoming POST /ask requests."""
@@ -51,6 +57,13 @@ class AskRequest(BaseModel):
     # Atributo único que representa la pregunta del usuario. Pydantic validará
     # automáticamente que se reciba como cadena de texto en el cuerpo JSON.
     question: str
+    # Identificador obligatorio del usuario que realiza la pregunta. Permite
+    # mantener historiales independientes por cada persona que interactúa con
+    # la API.
+    user_id: str
+    # Identificador opcional de conversación. Si no se envía, todas las
+    # preguntas de un usuario compartirán el mismo historial.
+    conversation_id: str | None = None
 
 
 class AskResponse(BaseModel):
@@ -62,6 +75,9 @@ class AskResponse(BaseModel):
     # respaldar la respuesta. Se envía como lista para que el cliente pueda
     # mostrar cada cita por separado.
     context: List[str]
+    # Identificador de conversación efectivo que se utilizó para almacenar el
+    # historial. El cliente puede conservarlo para futuras solicitudes.
+    conversation_id: str
 
 
 def load_pdf_documents(pdf_dir: str) -> List[Document]:
@@ -214,11 +230,24 @@ def ask_question(payload: AskRequest) -> AskResponse:
     if not payload.question.strip():
         raise HTTPException(status_code=400, detail="Question must not be empty.")
 
+    if not payload.user_id.strip():
+        raise HTTPException(status_code=400, detail="user_id must not be empty.")
+
+    # Normaliza el identificador de conversación. Si el cliente no especifica
+    # uno, se utiliza "default" para agrupar todas las preguntas de ese usuario.
+    conversation_id = payload.conversation_id or "default"
+    session_key = (payload.user_id, conversation_id)
+    history = conversation_histories.setdefault(session_key, [])
+
+    # Se envía el historial completo a la cadena de LangChain. Algunos modelos
+    # lo ignoran, pero otros pueden aprovecharlo para respuestas más coherentes.
+    chat_history = list(history)
+
     # Run the retrieval QA chain to obtain both the answer and the source documents.
     # El objeto ``qa_chain`` se comporta como una función: recibe un diccionario
     # con la clave "query" y devuelve otro diccionario que incluye la respuesta
     # generada y los documentos relevantes.
-    result = qa_chain({"query": payload.question})
+    result = qa_chain({"query": payload.question, "chat_history": chat_history})
     answer = result.get("result", "No answer generated.")
 
     source_docs = result.get("source_documents", [])
@@ -256,7 +285,14 @@ def ask_question(payload: AskRequest) -> AskResponse:
         snippet = f"Source: {source} (page {page_display})\n{page_content}"
         context_snippets.append(snippet)
 
-    return AskResponse(answer=answer, context=context_snippets)
+    # Actualiza el historial almacenando la nueva pareja pregunta/respuesta.
+    history.append((payload.question, answer))
+
+    return AskResponse(
+        answer=answer,
+        context=context_snippets,
+        conversation_id=conversation_id,
+    )
 
 
 @app.get("/")

@@ -116,7 +116,11 @@ class DummyDoc:
 
 
 class DummyChain:
+    def __init__(self):
+        self.calls = []
+
     def __call__(self, query):
+        self.calls.append(query)
         return {
             "result": "dummy answer",
             "source_documents": [
@@ -131,15 +135,17 @@ class DummyChain:
 def test_client(monkeypatch):
     chain = DummyChain()
     monkeypatch.setattr(main, "initialize_qa_chain", lambda: chain)
+    main._dummy_chain = chain  # type: ignore[attr-defined]
 
     with TestClient(main.app) as client:
         yield client
 
     main.qa_chain = None
+    main.conversation_histories.clear()
 
 
 def test_ask_question_deduplicates_sources(test_client):
-    response = test_client.post("/ask", json={"question": "What?"})
+    response = test_client.post("/ask", json={"question": "What?", "user_id": "u1"})
     assert response.status_code == 200
 
     data = response.json()
@@ -148,3 +154,30 @@ def test_ask_question_deduplicates_sources(test_client):
         "Source: file1.pdf (page 1)\ncontent A",
         "Source: file2.pdf (page 2)\ncontent B",
     ]
+    assert data["conversation_id"] == "default"
+
+
+def test_conversation_history_is_tracked_per_user(test_client):
+    response1 = test_client.post(
+        "/ask",
+        json={"question": "First?", "user_id": "u1", "conversation_id": "thread"},
+    )
+    assert response1.status_code == 200
+
+    response2 = test_client.post(
+        "/ask",
+        json={"question": "Second?", "user_id": "u1", "conversation_id": "thread"},
+    )
+    assert response2.status_code == 200
+
+    response3 = test_client.post(
+        "/ask",
+        json={"question": "Other?", "user_id": "u2", "conversation_id": "thread"},
+    )
+    assert response3.status_code == 200
+
+    calls = main._dummy_chain.calls  # type: ignore[attr-defined]
+    assert calls[0]["chat_history"] == []
+    assert calls[1]["chat_history"] == [("First?", "dummy answer")]
+    # A different usuario must not receive the previous history.
+    assert calls[2]["chat_history"] == []
