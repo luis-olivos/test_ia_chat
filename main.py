@@ -83,7 +83,6 @@ def build_vector_store(documents: List[Document]) -> Chroma:
         embedding=embeddings,
         persist_directory=CHROMA_DIR,
     )
-    vector_store.persist()
     return vector_store
 
 
