@@ -27,6 +27,7 @@ def _install_stub_modules() -> None:
     # langchain_core.documents
     langchain_core = ModuleType("langchain_core")
     langchain_core_documents = ModuleType("langchain_core.documents")
+    langchain_core_prompts = ModuleType("langchain_core.prompts")
 
     class _Document:
         def __init__(self, page_content="", metadata=None):
@@ -34,8 +35,16 @@ def _install_stub_modules() -> None:
             self.metadata = metadata or {}
 
     langchain_core_documents.Document = _Document
+    class _PromptTemplate:
+        def __init__(self, template="", input_variables=None):
+            self.template = template
+            self.input_variables = input_variables or []
+
+    langchain_core_prompts.PromptTemplate = _PromptTemplate
+
     sys.modules["langchain_core"] = langchain_core
     sys.modules["langchain_core.documents"] = langchain_core_documents
+    sys.modules["langchain_core.prompts"] = langchain_core_prompts
 
     # langchain_text_splitters
     langchain_text_splitters = ModuleType("langchain_text_splitters")
