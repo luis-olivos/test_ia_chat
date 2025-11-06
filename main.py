@@ -101,7 +101,7 @@ def initialize_qa_chain() -> RetrievalQA:
 
     vector_store = build_vector_store(documents)
 
-    llm = ChatGoogleGenerativeAI(model="gemini-pro", temperature=0.2)
+    llm = ChatGoogleGenerativeAI(model="gemini-1.5-pro", temperature=0.2)
 
     # Build a retriever from the vector store to be consumed by LangChain's RetrievalQA chain.
     retriever = vector_store.as_retriever(search_kwargs={"k": 4})
