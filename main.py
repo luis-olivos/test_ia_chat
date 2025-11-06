@@ -271,13 +271,29 @@ def ask_question(payload: AskRequest) -> AskResponse:
     # generada y los documentos relevantes.
     chat_history_text = summarize_chat_history(chat_history)
 
-    result = qa_chain(
-        {
-            "query": payload.question,
-            "chat_history": chat_history,
-            "chat_history_text": chat_history_text,
-        }
-    )
+    # ``RetrievalQA`` no reconoce variables adicionales en cada llamada. Para
+    # poder incluir el historial resumido en el prompt personalizado realizamos
+    # un ``partial`` del template antes de ejecutar la cadena y restauramos el
+    # original al finalizar. De esta forma "chat_history_text" queda fijado en
+    # el prompt sin que LangChain exija recibirlo explícitamente como parámetro.
+    combine_chain = getattr(qa_chain, "combine_documents_chain", None)
+    llm_chain = getattr(combine_chain, "llm_chain", None)
+    original_prompt = getattr(llm_chain, "prompt", None)
+
+    if llm_chain is not None and original_prompt is not None:
+        llm_chain.prompt = original_prompt.partial(chat_history_text=chat_history_text)
+
+    try:
+        result = qa_chain(
+            {
+                "query": payload.question,
+                "chat_history": chat_history,
+                "chat_history_text": chat_history_text,
+            }
+        )
+    finally:
+        if llm_chain is not None and original_prompt is not None:
+            llm_chain.prompt = original_prompt
     answer = result.get("result", "No answer generated.")
 
     source_docs = result.get("source_documents", [])
