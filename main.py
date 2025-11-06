@@ -14,8 +14,11 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from PyPDF2 import PdfReader
+from dotenv import load_dotenv
 
 # Configuration constants controlled by environment variables for flexibility.
+# Carga las variables del archivo .env
+load_dotenv()
 PDF_FOLDER = os.getenv("PDF_FOLDER", "pdfs")
 CHROMA_DIR = os.getenv("CHROMA_DIR", "chroma_store")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")  # Must be set externally before running the app.
