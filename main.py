@@ -154,16 +154,25 @@ def initialize_qa_chain() -> RetrievalQA:
     # contexto recuperado y la pregunta original.
     prompt = PromptTemplate(
         template=(
-            "Eres un asistente servicial. Debes responder en español y ser claro y amable.\n"
-            "Usa únicamente HTML básico (<h2>, <p>, <ul>, <li>, <strong>) sin estilos en línea.\n"
-            "Estructura la respuesta siguiendo este formato: \n"
-            "- Un <p> con la explicación principal breve.\n"
-            "- Si aplica, una lista con <ul> y <li> para pasos o puntos clave.\n"
-            "- Finaliza con un <p> citando el manual o fuente de la información.\n"
-            "Incluye la información de las fuentes usando los metadatos proporcionados.\n\n"
+            """📋 Instrucciones:
+            - Usa únicamente HTML básico: <h2>, <p>, <ul>, <li>, <strong>.  
+            - No incluyas estilos en línea ni enlaces.
+            - Estructura tus respuestas así:
+            1. Un <p> inicial con la explicación principal (máximo 3 líneas).
+            2. Si aplica, una lista <ul><li> con puntos o pasos clave.
+            3. Al final, una breve referencia a la fuente si está disponible.
+
+            ⚠️ Reglas de comportamiento:
+            - Si el usuario solo saluda (“hola”, “buen día”, “gracias”, etc.), responde amablemente con un saludo breve y servicial.**no incluyas ningún contenido del contexto**.
+            - Si la pregunta **no tiene relación con el contexto** o el contexto **no contiene información útil**, responde exactamente:
+            <p>No encontré información relacionada en la documentación.</p>
+            - Si la respuesta requiere información extensa, **resume solo lo esencial** (máximo 5 líneas de texto total).
+            - No cites todo el documento ni fragmentos largos.
+            - No uses frases como “según la información proporcionada” ni “de acuerdo al contexto”.
+            
             "Contexto disponible:\n{context}\n\n"
             "Pregunta del usuario: {question}\n\n"
-            "Respuesta en HTML:"
+            "Respuesta en HTML:"""
         ),
         input_variables=["context", "question"],
     )
