@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import glob
+import json
+import logging
 import os
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import List, Protocol, Tuple
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -17,10 +19,32 @@ from langchain_community.vectorstores import Chroma
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from PyPDF2 import PdfReader
 from dotenv import load_dotenv
+from redis import Redis
+from redis.exceptions import RedisError
 
 # Configuration constants controlled by environment variables for flexibility.
 # Carga las variables del archivo .env
 load_dotenv()#
+# Configuramos un logger de módulo para reportar problemas con el backend de
+# historiales sin inundar stdout.
+logger = logging.getLogger(__name__)
+
+
+def _read_positive_int(name: str, *, default: int | None = None) -> int | None:
+    """Leer una variable de entorno y devolverla como entero positivo."""
+
+    raw_value = os.getenv(name)
+    if raw_value is None or raw_value.strip() == "":
+        return default
+
+    try:
+        parsed = int(raw_value)
+    except ValueError as exc:  # pragma: no cover - solo se activa ante mala configuración.
+        raise RuntimeError(f"{name} debe ser un entero válido.") from exc
+
+    if parsed <= 0:
+        return None
+    return parsed
 # ---------------------------------------------------------------------------
 # Configuración general
 # ---------------------------------------------------------------------------
@@ -37,6 +61,22 @@ CHROMA_DIR = os.getenv("CHROMA_DIR", "chroma_store")
 # proporcionarse fuera del código (por motivos de seguridad) antes de arrancar
 # la API.
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")  # Must be set externally before running the app.
+# URL de conexión a Redis que compartirán todos los workers. Se puede ajustar a
+# servicios administrados (por ejemplo, ElastiCache) sin modificar el código:
+# en producción basta con definir la variable de entorno ``REDIS_URL`` con la
+# cadena de conexión adecuada.
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+# Máximo de turnos que se conservarán por conversación en el backend. No tiene
+# por qué coincidir con ``MAX_HISTORY_TURNS`` porque aquí controlamos cuánto
+# historial completo queremos persistir.
+MAX_STORED_TURNS = _read_positive_int("MAX_STORED_TURNS", default=50)
+# Tiempo de vida opcional para cada historial. Si es ``None`` el historial se
+# conserva indefinidamente hasta que el usuario lo elimine manualmente.
+HISTORY_TTL_SECONDS = _read_positive_int("HISTORY_TTL_SECONDS")
+
+# Alias de tipos para mantener legibles las anotaciones que utilizan listas de
+# pares ``(pregunta, respuesta)``.
+ConversationHistory = List[Tuple[str, str]]
 
 app = FastAPI(title="PDF Question Answering API")
 
@@ -45,11 +85,132 @@ app = FastAPI(title="PDF Question Answering API")
 # tubería de LangChain en cada petición HTTP, lo que reduciría el rendimiento.
 qa_chain: RetrievalQA | None = None
 
-# Diccionario en memoria que conserva el historial de cada combinación
-# usuario/conversación. La clave es una tupla ``(user_id, conversation_id)`` y
-# el valor es una lista de pares ``(pregunta, respuesta)`` en orden cronológico.
-ConversationHistory = List[Tuple[str, str]]
-conversation_histories: Dict[Tuple[str, str], ConversationHistory] = {}
+# ``conversation_store`` proporciona un backend compartido (Redis en este caso)
+# donde se almacena de forma segura el historial de preguntas/respuestas por
+# usuario y conversación. Esto permite que múltiples instancias del servidor
+# compartan contexto sin depender de memoria local.
+conversation_store: "ConversationStore" | None = None
+
+
+class ConversationStore(Protocol):
+    """Contrato mínimo que deben cumplir los backends de historial."""
+
+    def load_history(self, user_id: str, conversation_id: str) -> ConversationHistory:
+        ...
+
+    def append_turn(
+        self, user_id: str, conversation_id: str, question: str, answer: str
+    ) -> None:
+        ...
+
+
+class ConversationStoreError(RuntimeError):
+    """Error controlado que indica fallos al acceder al backend de historiales."""
+
+
+class RedisConversationStore:
+    """Implementación basada en listas Redis para almacenar turnos de conversación."""
+
+    def __init__(
+        self,
+        client: Redis,
+        *,
+        max_length: int | None = None,
+        ttl_seconds: int | None = None,
+    ) -> None:
+        self._client = client
+        self._max_length = max_length
+        self._ttl_seconds = ttl_seconds
+
+    @staticmethod
+    def _build_key(user_id: str, conversation_id: str) -> str:
+        # Los dos identificadores se concatenan de forma directa. Redis permite
+        # caracteres especiales, pero usar ``:`` facilita inspeccionar claves.
+        return f"chat:{user_id}:{conversation_id}"
+
+    def load_history(self, user_id: str, conversation_id: str) -> ConversationHistory:
+        key = self._build_key(user_id, conversation_id)
+        try:
+            entries = self._client.lrange(key, 0, -1)
+        except RedisError as exc:  # pragma: no cover - solo ante fallos de red.
+            raise ConversationStoreError("No fue posible recuperar el historial desde Redis.") from exc
+
+        history: ConversationHistory = []
+        for raw_entry in entries:
+            try:
+                payload = json.loads(raw_entry)
+            except json.JSONDecodeError:
+                # Si encontramos datos corruptos los ignoramos para no bloquear la conversación.
+                logger.warning("Entrada de historial dañada en Redis para %s", key)
+                continue
+
+            question = payload.get("q", "")
+            answer = payload.get("a", "")
+            history.append((question, answer))
+        return history
+
+    def append_turn(
+        self, user_id: str, conversation_id: str, question: str, answer: str
+    ) -> None:
+        key = self._build_key(user_id, conversation_id)
+        entry = json.dumps({"q": question, "a": answer}, ensure_ascii=False)
+        try:
+            pipeline = self._client.pipeline()
+            pipeline.rpush(key, entry)
+            if self._max_length:
+                pipeline.ltrim(key, -self._max_length, -1)
+            if self._ttl_seconds:
+                pipeline.expire(key, self._ttl_seconds)
+            pipeline.execute()
+        except RedisError as exc:  # pragma: no cover - solo ante fallos de red.
+            raise ConversationStoreError("No fue posible guardar el historial en Redis.") from exc
+
+
+class InMemoryConversationStore:
+    """Versión en memoria útil para pruebas unitarias o desarrollo local."""
+
+    def __init__(self, *, max_length: int | None = None) -> None:
+        self._storage: dict[str, ConversationHistory] = {}
+        self._max_length = max_length
+
+    @staticmethod
+    def _build_key(user_id: str, conversation_id: str) -> str:
+        return f"{user_id}::{conversation_id}"
+
+    def load_history(self, user_id: str, conversation_id: str) -> ConversationHistory:
+        key = self._build_key(user_id, conversation_id)
+        history = self._storage.get(key, [])
+        # Devolvemos una copia para evitar que el llamador modifique el listado interno.
+        return list(history)
+
+    def append_turn(
+        self, user_id: str, conversation_id: str, question: str, answer: str
+    ) -> None:
+        key = self._build_key(user_id, conversation_id)
+        history = self._storage.setdefault(key, [])
+        history.append((question, answer))
+        if self._max_length and len(history) > self._max_length:
+            self._storage[key] = history[-self._max_length :]
+
+    def clear(self) -> None:
+        self._storage.clear()
+
+
+def create_conversation_store() -> ConversationStore:
+    """Inicializa el backend de historiales compartido usando Redis."""
+
+    try:
+        client = Redis.from_url(REDIS_URL, decode_responses=True)
+        # ``ping`` fuerza una conexión temprana y falla rápido si Redis no está disponible.
+        client.ping()
+    except RedisError as exc:  # pragma: no cover - se activa solo si Redis está caído.
+        raise ConversationStoreError("No se pudo conectar a Redis para el historial de chats.") from exc
+
+    return RedisConversationStore(
+        client,
+        max_length=MAX_STORED_TURNS,
+        ttl_seconds=HISTORY_TTL_SECONDS,
+    )
 
 # Número máximo de turnos previos que se incluirán al condensar el historial
 # de chat. Mantenerlo acotado evita que el prompt crezca sin control mientras
@@ -251,7 +412,8 @@ def on_startup() -> None:
     # FastAPI ejecuta esta función automáticamente al iniciar el servidor.
     # Construir el ``qa_chain`` aquí garantiza que los recursos pesados (lectura
     # de PDF, generación de embeddings, etc.) se realicen una única vez.
-    global qa_chain
+    global qa_chain, conversation_store
+    conversation_store = create_conversation_store()
     qa_chain = initialize_qa_chain()
 
 
@@ -271,12 +433,16 @@ def ask_question(payload: AskRequest) -> AskResponse:
     # Normaliza el identificador de conversación. Si el cliente no especifica
     # uno, se utiliza "default" para agrupar todas las preguntas de ese usuario.
     conversation_id = payload.conversation_id or "default"
-    session_key = (payload.user_id, conversation_id)
-    history = conversation_histories.setdefault(session_key, [])
+    if conversation_store is None:
+        raise HTTPException(status_code=503, detail="Conversation store is not ready yet.")
 
-    # Se envía el historial completo a la cadena de LangChain. Algunos modelos
-    # lo ignoran, pero otros pueden aprovecharlo para respuestas más coherentes.
-    chat_history = list(history)
+    try:
+        # Se recupera el historial desde Redis para que todos los workers
+        # compartan exactamente el mismo contexto.
+        chat_history = conversation_store.load_history(payload.user_id, conversation_id)
+    except ConversationStoreError as exc:
+        logger.error("Fallo al recuperar el historial: %s", exc)
+        raise HTTPException(status_code=503, detail="Failed to load conversation history.") from exc
 
     # Run the retrieval QA chain to obtain both the answer and the source documents.
     # El objeto ``qa_chain`` se comporta como una función: recibe un diccionario
@@ -346,8 +512,14 @@ def ask_question(payload: AskRequest) -> AskResponse:
         snippet = f"Source: {source} (page {page_display})\n{page_content}"
         context_snippets.append(snippet)
 
-    # Actualiza el historial almacenando la nueva pareja pregunta/respuesta.
-    history.append((payload.question, answer))
+    # Actualiza el historial almacenando la nueva pareja pregunta/respuesta en
+    # el backend compartido. ``append_turn`` usa operaciones atómicas (RPUSH +
+    # LTRIM) para evitar condiciones de carrera entre múltiples peticiones.
+    try:
+        conversation_store.append_turn(payload.user_id, conversation_id, payload.question, answer)
+    except ConversationStoreError as exc:
+        logger.error("Fallo al guardar el historial: %s", exc)
+        raise HTTPException(status_code=503, detail="Failed to persist conversation history.") from exc
 
     return AskResponse(
         answer=answer,
