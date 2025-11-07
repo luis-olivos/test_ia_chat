@@ -376,7 +376,8 @@ def initialize_qa_chain() -> RetrievalQA:
             "Pregunta del usuario: {question}\n\n"
             "Respuesta en HTML:"""
         ),
-        input_variables=["context", "question", "chat_history_text"],
+        input_variables=["context", "question"],
+        partial_variables={"chat_history_text": "(sin historial previo)"},
     )
 
     # Build a retriever from the vector store to be consumed by LangChain's RetrievalQA chain.
