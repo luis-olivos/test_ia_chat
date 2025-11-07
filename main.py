@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import glob
 import os
+from pathlib import Path
 from typing import Dict, List, Tuple
 
 from fastapi import FastAPI, HTTPException
@@ -116,18 +117,24 @@ def load_pdf_documents(pdf_dir: str) -> List[Document]:
     return documents
 
 
-def build_vector_store(documents: List[Document]) -> Chroma:
-    """Create (or update) a Chroma vector store with Google embeddings from the documents."""
+def _get_embeddings_model() -> GoogleGenerativeAIEmbeddings:
+    """Return the embeddings model configured for the application."""
 
     if not GOOGLE_API_KEY:
         raise RuntimeError(
             "GOOGLE_API_KEY environment variable must be set with a valid Gemini API key."
         )
 
-    # Las "embeddings" convierten cada fragmento de texto en un vector de
-    # números que captura su significado. Este modelo específico proviene del
-    # servicio Gemini.
-    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+    return GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+
+
+def build_vector_store(
+    documents: List[Document],
+    persist_directory: str | None = None,
+) -> Chroma:
+    """Create (or update) a Chroma vector store with Google embeddings from the documents."""
+
+    embeddings = _get_embeddings_model()
 
     # Split documents into smaller chunks to improve retrieval granularity.
     splitter = RecursiveCharacterTextSplitter(
@@ -140,29 +147,35 @@ def build_vector_store(documents: List[Document]) -> Chroma:
     # representa una idea más concreta.
     split_docs = splitter.split_documents(documents)
 
-    # Create or load the Chroma vector store persisted on disk.
+    directory = persist_directory or CHROMA_DIR
     vector_store = Chroma.from_documents(
         documents=split_docs,
         embedding=embeddings,
-        persist_directory=CHROMA_DIR,
+        persist_directory=directory,
     )
+    vector_store.persist()
     return vector_store
+
+
+def load_vector_store(persist_directory: str | None = None) -> Chroma:
+    """Open the existing Chroma store previously generated offline."""
+
+    embeddings = _get_embeddings_model()
+
+    directory = Path(persist_directory or CHROMA_DIR)
+    if not directory.exists() or not any(directory.iterdir()):
+        raise RuntimeError(
+            f"Chroma directory '{directory}' is missing or empty. Run the offline indexing pipeline first."
+        )
+
+    return Chroma(persist_directory=str(directory), embedding_function=embeddings)
 
 
 def initialize_qa_chain() -> RetrievalQA:
     """Construct the RetrievalQA chain that uses Gemini for answer generation."""
 
-    # Cargar los documentos es el primer paso para poder construir el índice.
-    documents = load_pdf_documents(PDF_FOLDER)
-    if not documents:
-        raise RuntimeError(
-            f"No PDF documents found in '{PDF_FOLDER}'. Add PDFs before starting the service."
-        )
-
-    # ``build_vector_store`` devuelve un almacén vectorial listo para ser
-    # consultado. Este almacén contiene los vectores calculados para cada
-    # fragmento de los PDF.
-    vector_store = build_vector_store(documents)
+    # ``load_vector_store`` abre el índice persistente generado previamente.
+    vector_store = load_vector_store()
 
 
     # ``ChatGoogleGenerativeAI`` es el wrapper de LangChain que permite invocar a
