@@ -5,3 +5,4 @@ langchain-google-genai
 chromadb
 PyPDF2
 pydantic
+redis

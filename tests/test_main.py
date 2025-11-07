@@ -103,6 +103,27 @@ def _install_stub_modules() -> None:
     pypdf2.PdfReader = _PdfReader
     sys.modules["PyPDF2"] = pypdf2
 
+    # redis
+    redis_module = ModuleType("redis")
+
+    class _FakeRedis:
+        @classmethod
+        def from_url(cls, *args, **kwargs):  # pragma: no cover - no se usa en pruebas.
+            return cls()
+
+        def ping(self):  # pragma: no cover - no se usa en pruebas.
+            pass
+
+    redis_module.Redis = _FakeRedis
+    redis_exceptions = ModuleType("redis.exceptions")
+
+    class _RedisError(Exception):
+        pass
+
+    redis_exceptions.RedisError = _RedisError
+    sys.modules["redis"] = redis_module
+    sys.modules["redis.exceptions"] = redis_exceptions
+
 
 _install_stub_modules()
 
@@ -144,11 +165,17 @@ def test_client(monkeypatch):
     monkeypatch.setattr(main, "initialize_qa_chain", lambda: chain)
     main._dummy_chain = chain  # type: ignore[attr-defined]
 
+    store = main.InMemoryConversationStore(max_length=main.MAX_STORED_TURNS)
+    monkeypatch.setattr(main, "create_conversation_store", lambda: store)
+    main._dummy_store = store  # type: ignore[attr-defined]
+
     with TestClient(main.app) as client:
         yield client
 
     main.qa_chain = None
-    main.conversation_histories.clear()
+    if hasattr(main, "_dummy_store"):
+        main._dummy_store.clear()  # type: ignore[attr-defined]
+    main.conversation_store = None
 
 
 def test_ask_question_deduplicates_sources(test_client):
