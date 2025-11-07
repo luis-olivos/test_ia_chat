@@ -455,20 +455,35 @@ def ask_question(payload: AskRequest) -> AskResponse:
     chat_history_text = summarize_chat_history(chat_history)
 
     # ``RetrievalQA`` no reconoce variables adicionales en cada llamada. Para
-    # poder incluir el historial resumido en el prompt personalizado realizamos
-    # un ``partial`` del template antes de ejecutar la cadena y restauramos el
-    # original al finalizar. De esta forma "chat_history_text" queda fijado en
-    # el prompt sin que LangChain exija recibirlo explícitamente como parámetro.
-    combine_chain = getattr(qa_chain, "combine_documents_chain", None)
-    llm_chain = getattr(combine_chain, "llm_chain", None)
-    original_prompt = getattr(llm_chain, "prompt", None)
+    # poder incluir el historial resumido en el prompt reutilizamos la cadena
+    # de forma segura creando un ``partial`` independiente por petición en lugar
+    # de modificar el prompt global (lo que provocaba condiciones de carrera
+    # bajo carga). Si la optimización falla por cualquier motivo, se recurre al
+    # flujo estándar de ``qa_chain`` como mecanismo de respaldo.
+    llm_chain = getattr(getattr(qa_chain, "combine_documents_chain", None), "llm_chain", None)
 
-    if llm_chain is not None and original_prompt is not None:
-        llm_chain.prompt = original_prompt.partial(chat_history_text=chat_history_text)
+    result = None
 
-    print(chat_history_text)
+    if llm_chain is not None and hasattr(llm_chain, "partial"):
+        try:
+            llm_with_history = llm_chain.partial(chat_history_text=chat_history_text)
+            retriever = getattr(qa_chain, "retriever", None)
 
-    try:
+            if retriever is not None and hasattr(retriever, "get_relevant_documents"):
+                source_docs = retriever.get_relevant_documents(payload.question)
+                context = "\n\n".join((doc.page_content or "") for doc in source_docs)
+                answer_text = llm_with_history.run(
+                    context=context,
+                    question=payload.question,
+                )
+                result = {
+                    "result": answer_text,
+                    "source_documents": source_docs,
+                }
+        except Exception as exc:  # pragma: no cover - solo ante fallos en la cadena real.
+            logger.exception("Fallo al ejecutar la cadena con historial parcial: %s", exc)
+
+    if result is None:
         result = qa_chain(
             {
                 "query": payload.question,
@@ -476,9 +491,6 @@ def ask_question(payload: AskRequest) -> AskResponse:
                 "chat_history_text": chat_history_text,
             }
         )
-    finally:
-        if llm_chain is not None and original_prompt is not None:
-            llm_chain.prompt = original_prompt
     answer = result.get("result", "No answer generated.")
 
     source_docs = result.get("source_documents", [])
