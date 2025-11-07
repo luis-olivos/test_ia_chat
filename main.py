@@ -283,6 +283,8 @@ def ask_question(payload: AskRequest) -> AskResponse:
     if llm_chain is not None and original_prompt is not None:
         llm_chain.prompt = original_prompt.partial(chat_history_text=chat_history_text)
 
+    print(chat_history_text)
+
     try:
         result = qa_chain(
             {
