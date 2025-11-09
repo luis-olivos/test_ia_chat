@@ -5,10 +5,12 @@ import glob
 import json
 import logging
 import os
+import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from pathlib import Path
-from typing import List, Protocol, Tuple
+from typing import Callable, List, Protocol, Tuple, TypeVar
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
@@ -20,6 +22,7 @@ from langchain_community.vectorstores import Chroma
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from PyPDF2 import PdfReader
 from dotenv import load_dotenv
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 from redis import Redis
 from redis.exceptions import RedisError
 
@@ -45,6 +48,23 @@ def _read_positive_int(name: str, *, default: int | None = None) -> int | None:
 
     if parsed <= 0:
         return None
+    return parsed
+
+
+def _read_non_negative_float(name: str, *, default: float = 0.0) -> float:
+    """Leer una variable de entorno y devolverla como ``float`` no negativo."""
+
+    raw_value = os.getenv(name)
+    if raw_value is None or raw_value.strip() == "":
+        return default
+
+    try:
+        parsed = float(raw_value)
+    except ValueError as exc:  # pragma: no cover - solo ante mala configuración.
+        raise RuntimeError(f"{name} debe ser un número válido.") from exc
+
+    if parsed < 0:
+        return default
     return parsed
 # ---------------------------------------------------------------------------
 # Configuración general
@@ -77,10 +97,65 @@ MAX_STORED_TURNS = _read_positive_int("MAX_STORED_TURNS", default=50)
 # Tiempo de vida opcional para cada historial. Si es ``None`` el historial se
 # conserva indefinidamente hasta que el usuario lo elimine manualmente.
 HISTORY_TTL_SECONDS = _read_positive_int("HISTORY_TTL_SECONDS")
+# Límite blando en bytes para mantener los historiales en memoria dentro de
+# un presupuesto acotado y evitar que el proceso crezca indefinidamente cuando
+# se atienden conversaciones de larga duración.
+CHAT_HISTORY_MEMORY_LIMIT_BYTES = _read_positive_int(
+    "CHAT_HISTORY_MEMORY_LIMIT_BYTES", default=262_144
+)
+# Parámetros de resiliencia para el retriever y el modelo generativo.
+RETRIEVER_TIMEOUT_SECONDS = _read_positive_int("RETRIEVER_TIMEOUT_SECONDS", default=30)
+LLM_TIMEOUT_SECONDS = _read_positive_int("LLM_TIMEOUT_SECONDS", default=60)
+RETRIEVER_MAX_RETRIES = _read_positive_int("RETRIEVER_MAX_RETRIES", default=2)
+LLM_MAX_RETRIES = _read_positive_int("LLM_MAX_RETRIES", default=1)
+RETRY_BACKOFF_SECONDS = _read_non_negative_float("RETRY_BACKOFF_SECONDS", default=0.5)
 
 # Alias de tipos para mantener legibles las anotaciones que utilizan listas de
 # pares ``(pregunta, respuesta)``.
 ConversationHistory = List[Tuple[str, str]]
+T = TypeVar("T")
+
+# Métricas de observabilidad expuestas vía Prometheus/OpenTelemetry.
+RETRIEVER_LATENCY_SECONDS = Histogram(
+    "retriever_latency_seconds",
+    "Duración de las operaciones de recuperación de documentos.",
+    buckets=(0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 20, 30, 60),
+)
+LLM_LATENCY_SECONDS = Histogram(
+    "llm_latency_seconds",
+    "Tiempo empleado por el modelo generativo para producir respuestas.",
+    buckets=(0.1, 0.25, 0.5, 1, 2, 5, 10, 20, 30, 60, 120),
+)
+RETRIEVER_TIMEOUTS_TOTAL = Counter(
+    "retriever_timeouts_total", "Número de timeouts al consultar el retriever."
+)
+LLM_TIMEOUTS_TOTAL = Counter(
+    "llm_timeouts_total", "Número de timeouts al invocar el modelo generativo."
+)
+RETRIEVER_RETRIES_TOTAL = Counter(
+    "retriever_retries_total",
+    "Intentos adicionales realizados para recuperar documentos tras un fallo.",
+)
+LLM_RETRIES_TOTAL = Counter(
+    "llm_retries_total",
+    "Intentos adicionales realizados tras errores del modelo generativo.",
+)
+RETRIEVER_FAILURES_TOTAL = Counter(
+    "retriever_failures_total",
+    "Fallos definitivos del retriever tras agotar los reintentos.",
+)
+LLM_FAILURES_TOTAL = Counter(
+    "llm_failures_total",
+    "Fallos definitivos del modelo generativo tras agotar los reintentos.",
+)
+CHAT_HISTORY_MEMORY_BYTES = Gauge(
+    "chat_history_memory_bytes",
+    "Uso estimado de memoria (en bytes) del historial pasado al prompt.",
+)
+CHAT_HISTORY_TRUNCATIONS_TOTAL = Counter(
+    "chat_history_truncations_total",
+    "Veces que el historial se recortó por superar el límite de memoria.",
+)
 
 app = FastAPI(title="PDF Question Answering API")
 
@@ -572,6 +647,118 @@ def _build_search_kwargs(question: str) -> dict[str, object]:
     return search_kwargs
 
 
+def _estimate_turn_size(question: str, answer: str) -> int:
+    """Calcula el tamaño aproximado de un turno en bytes."""
+
+    return len(question.encode("utf-8")) + len(answer.encode("utf-8"))
+
+
+def _estimate_history_size(history: ConversationHistory) -> int:
+    """Devuelve el tamaño estimado en bytes de todo el historial."""
+
+    return sum(_estimate_turn_size(question, answer) for question, answer in history)
+
+
+def _trim_history_to_budget(history: ConversationHistory, limit_bytes: int) -> ConversationHistory:
+    """Recorta el historial manteniendo los turnos más recientes dentro del límite."""
+
+    if limit_bytes <= 0:
+        return history
+
+    trimmed: list[Tuple[str, str]] = []
+    total = 0
+    for question, answer in reversed(history):
+        entry_size = _estimate_turn_size(question, answer)
+        trimmed.append((question, answer))
+        total += entry_size
+        if total >= limit_bytes:
+            break
+    trimmed.reverse()
+    return trimmed or history[-1:]
+
+
+def _prepare_history_for_prompt(history: ConversationHistory) -> ConversationHistory:
+    """Actualiza métricas de memoria y aplica recortes si es necesario."""
+
+    if not history:
+        CHAT_HISTORY_MEMORY_BYTES.set(0)
+        return history
+
+    estimated_bytes = _estimate_history_size(history)
+    CHAT_HISTORY_MEMORY_BYTES.set(float(estimated_bytes))
+
+    limit = CHAT_HISTORY_MEMORY_LIMIT_BYTES
+    if limit is not None and estimated_bytes > limit:
+        trimmed_history = _trim_history_to_budget(history, limit)
+        trimmed_bytes = _estimate_history_size(trimmed_history)
+        CHAT_HISTORY_MEMORY_BYTES.set(float(trimmed_bytes))
+        CHAT_HISTORY_TRUNCATIONS_TOTAL.inc()
+        logger.warning(
+            "Historial recortado por límite de memoria: %.0f bytes (límite %s bytes).",
+            estimated_bytes,
+            limit,
+        )
+        return trimmed_history
+
+    return history
+
+
+def _run_with_timeout(operation: Callable[[], T], timeout_seconds: int | None) -> T:
+    """Ejecuta ``operation`` con un timeout opcional usando un hilo auxiliar."""
+
+    if timeout_seconds is None:
+        return operation()
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(operation)
+        try:
+            return future.result(timeout=timeout_seconds)
+        except FuturesTimeoutError as exc:
+            future.cancel()
+            raise TimeoutError("Operation timed out") from exc
+
+
+def _execute_with_metrics(
+    operation: Callable[[], T],
+    *,
+    latency_metric: Histogram,
+    timeout_counter: Counter,
+    failure_counter: Counter,
+    retry_counter: Counter,
+    timeout_seconds: int | None,
+    max_retries: int | None,
+    operation_name: str,
+) -> T:
+    """Ejecuta ``operation`` con métricas, reintentos y timeout."""
+
+    attempts = 1 + (max_retries or 0)
+    last_error: Exception | None = None
+
+    for attempt in range(1, attempts + 1):
+        start = time.perf_counter()
+        try:
+            result = _run_with_timeout(operation, timeout_seconds)
+            latency_metric.observe(time.perf_counter() - start)
+            return result
+        except TimeoutError as exc:
+            latency_metric.observe(time.perf_counter() - start)
+            timeout_counter.inc()
+            last_error = exc
+        except Exception as exc:  # pragma: no cover - solo ante fallos del backend real.
+            latency_metric.observe(time.perf_counter() - start)
+            last_error = exc
+
+        if attempt < attempts:
+            retry_counter.inc()
+            if RETRY_BACKOFF_SECONDS:
+                time.sleep(RETRY_BACKOFF_SECONDS)
+
+    failure_counter.inc()
+    raise RuntimeError(
+        f"{operation_name} falló tras {attempts} intentos."
+    ) from last_error
+
+
 @app.on_event("startup")
 def on_startup() -> None:
     """FastAPI startup hook to prepare the LangChain pipeline once when the server launches."""
@@ -613,28 +800,67 @@ def _execute_qa_chain(
                 search_kwargs = _build_search_kwargs(question)
                 vector_store = getattr(retriever, "vectorstore", None)
                 if vector_store is not None and hasattr(vector_store, "similarity_search"):
-                    source_docs = vector_store.similarity_search(
-                        question,
-                        k=int(search_kwargs.get("k", 4)),
-                        filter=search_kwargs.get("filter"),
+
+                    def _search_operation() -> List[Document]:
+                        return vector_store.similarity_search(
+                            question,
+                            k=int(search_kwargs.get("k", 4)),
+                            filter=search_kwargs.get("filter"),
+                        )
+
+                    source_docs = _execute_with_metrics(
+                        _search_operation,
+                        latency_metric=RETRIEVER_LATENCY_SECONDS,
+                        timeout_counter=RETRIEVER_TIMEOUTS_TOTAL,
+                        failure_counter=RETRIEVER_FAILURES_TOTAL,
+                        retry_counter=RETRIEVER_RETRIES_TOTAL,
+                        timeout_seconds=RETRIEVER_TIMEOUT_SECONDS,
+                        max_retries=RETRIEVER_MAX_RETRIES,
+                        operation_name="Retriever",
                     )
                 else:
-                    original_kwargs = getattr(retriever, "search_kwargs", None)
-                    merged_kwargs = {}
-                    if isinstance(original_kwargs, dict):
-                        merged_kwargs.update(original_kwargs)
-                    merged_kwargs.update(search_kwargs)
-                    if hasattr(retriever, "search_kwargs"):
-                        retriever.search_kwargs = merged_kwargs  # type: ignore[attr-defined]
-                    try:
-                        source_docs = retriever.get_relevant_documents(question)
-                    finally:
+
+                    def _search_operation() -> List[Document]:
+                        original_kwargs = getattr(retriever, "search_kwargs", None)
+                        merged_kwargs = {}
+                        if isinstance(original_kwargs, dict):
+                            merged_kwargs.update(original_kwargs)
+                        merged_kwargs.update(search_kwargs)
                         if hasattr(retriever, "search_kwargs"):
-                            retriever.search_kwargs = original_kwargs  # type: ignore[attr-defined]
+                            retriever.search_kwargs = merged_kwargs  # type: ignore[attr-defined]
+                        try:
+                            return retriever.get_relevant_documents(question)
+                        finally:
+                            if hasattr(retriever, "search_kwargs"):
+                                retriever.search_kwargs = original_kwargs  # type: ignore[attr-defined]
+
+                    source_docs = _execute_with_metrics(
+                        _search_operation,
+                        latency_metric=RETRIEVER_LATENCY_SECONDS,
+                        timeout_counter=RETRIEVER_TIMEOUTS_TOTAL,
+                        failure_counter=RETRIEVER_FAILURES_TOTAL,
+                        retry_counter=RETRIEVER_RETRIES_TOTAL,
+                        timeout_seconds=RETRIEVER_TIMEOUT_SECONDS,
+                        max_retries=RETRIEVER_MAX_RETRIES,
+                        operation_name="Retriever",
+                    )
                 context = "\n\n".join((doc.page_content or "") for doc in source_docs)
-                answer_text = llm_with_history.run(
-                    context=context,
-                    question=question,
+                
+                def _llm_operation() -> str:
+                    return llm_with_history.run(
+                        context=context,
+                        question=question,
+                    )
+
+                answer_text = _execute_with_metrics(
+                    _llm_operation,
+                    latency_metric=LLM_LATENCY_SECONDS,
+                    timeout_counter=LLM_TIMEOUTS_TOTAL,
+                    failure_counter=LLM_FAILURES_TOTAL,
+                    retry_counter=LLM_RETRIES_TOTAL,
+                    timeout_seconds=LLM_TIMEOUT_SECONDS,
+                    max_retries=LLM_MAX_RETRIES,
+                    operation_name="LLM",
                 )
                 result = {
                     "result": answer_text,
@@ -644,12 +870,24 @@ def _execute_qa_chain(
             logger.exception("Fallo al ejecutar la cadena con historial parcial: %s", exc)
 
     if result is None:
-        result = qa_chain(
-            {
-                "query": question,
-                "chat_history": chat_history,
-                "chat_history_text": chat_history_text,
-            }
+        def _fallback_operation() -> dict:
+            return qa_chain(
+                {
+                    "query": question,
+                    "chat_history": chat_history,
+                    "chat_history_text": chat_history_text,
+                }
+            )
+
+        result = _execute_with_metrics(
+            _fallback_operation,
+            latency_metric=LLM_LATENCY_SECONDS,
+            timeout_counter=LLM_TIMEOUTS_TOTAL,
+            failure_counter=LLM_FAILURES_TOTAL,
+            retry_counter=LLM_RETRIES_TOTAL,
+            timeout_seconds=LLM_TIMEOUT_SECONDS,
+            max_retries=LLM_MAX_RETRIES,
+            operation_name="LLM fallback",
         )
     return result
 
@@ -714,6 +952,8 @@ async def ask_question(payload: AskRequest) -> AskResponse:
     except ConversationStoreError as exc:
         logger.error("Fallo al recuperar el historial: %s", exc)
         raise HTTPException(status_code=503, detail="Failed to load conversation history.") from exc
+
+    chat_history = _prepare_history_for_prompt(chat_history)
 
     # Run the retrieval QA chain to obtain both the answer and the source documents.
     # El objeto ``qa_chain`` se comporta como una función: recibe un diccionario
@@ -802,6 +1042,13 @@ async def ask_question(payload: AskRequest) -> AskResponse:
         context=context_snippets,
         conversation_id=conversation_id,
     )
+
+
+@app.get("/metrics")
+def metrics() -> Response:
+    """Exponer las métricas en formato Prometheus/OpenTelemetry."""
+
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 @app.get("/")
