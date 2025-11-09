@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import List, Protocol, Tuple
 
 from fastapi import FastAPI, HTTPException
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
 from langchain_classic.chains import RetrievalQA
@@ -422,8 +423,52 @@ def on_startup() -> None:
     qa_chain = initialize_qa_chain()
 
 
+def _execute_qa_chain(
+    question: str,
+    chat_history: ConversationHistory,
+    chat_history_text: str,
+) -> dict:
+    """Run the blocking LangChain pipeline synchronously."""
+
+    if qa_chain is None:  # Defensive: the caller checks beforehand.
+        raise RuntimeError("QA chain is not initialized")
+
+    llm_chain = getattr(getattr(qa_chain, "combine_documents_chain", None), "llm_chain", None)
+
+    result = None
+
+    if llm_chain is not None and hasattr(llm_chain, "partial"):
+        try:
+            llm_with_history = llm_chain.partial(chat_history_text=chat_history_text)
+            retriever = getattr(qa_chain, "retriever", None)
+
+            if retriever is not None and hasattr(retriever, "get_relevant_documents"):
+                source_docs = retriever.get_relevant_documents(question)
+                context = "\n\n".join((doc.page_content or "") for doc in source_docs)
+                answer_text = llm_with_history.run(
+                    context=context,
+                    question=question,
+                )
+                result = {
+                    "result": answer_text,
+                    "source_documents": source_docs,
+                }
+        except Exception as exc:  # pragma: no cover - solo ante fallos en la cadena real.
+            logger.exception("Fallo al ejecutar la cadena con historial parcial: %s", exc)
+
+    if result is None:
+        result = qa_chain(
+            {
+                "query": question,
+                "chat_history": chat_history,
+                "chat_history_text": chat_history_text,
+            }
+        )
+    return result
+
+
 @app.post("/ask", response_model=AskResponse)
-def ask_question(payload: AskRequest) -> AskResponse:
+async def ask_question(payload: AskRequest) -> AskResponse:
     """Answer a user's question using Gemini and return the supporting PDF snippets."""
 
     if qa_chain is None:
@@ -444,7 +489,9 @@ def ask_question(payload: AskRequest) -> AskResponse:
     try:
         # Se recupera el historial desde Redis para que todos los workers
         # compartan exactamente el mismo contexto.
-        chat_history = conversation_store.load_history(payload.user_id, conversation_id)
+        chat_history = await run_in_threadpool(
+            conversation_store.load_history, payload.user_id, conversation_id
+        )
     except ConversationStoreError as exc:
         logger.error("Fallo al recuperar el historial: %s", exc)
         raise HTTPException(status_code=503, detail="Failed to load conversation history.") from exc
@@ -461,37 +508,12 @@ def ask_question(payload: AskRequest) -> AskResponse:
     # de modificar el prompt global (lo que provocaba condiciones de carrera
     # bajo carga). Si la optimización falla por cualquier motivo, se recurre al
     # flujo estándar de ``qa_chain`` como mecanismo de respaldo.
-    llm_chain = getattr(getattr(qa_chain, "combine_documents_chain", None), "llm_chain", None)
-
-    result = None
-
-    if llm_chain is not None and hasattr(llm_chain, "partial"):
-        try:
-            llm_with_history = llm_chain.partial(chat_history_text=chat_history_text)
-            retriever = getattr(qa_chain, "retriever", None)
-
-            if retriever is not None and hasattr(retriever, "get_relevant_documents"):
-                source_docs = retriever.get_relevant_documents(payload.question)
-                context = "\n\n".join((doc.page_content or "") for doc in source_docs)
-                answer_text = llm_with_history.run(
-                    context=context,
-                    question=payload.question,
-                )
-                result = {
-                    "result": answer_text,
-                    "source_documents": source_docs,
-                }
-        except Exception as exc:  # pragma: no cover - solo ante fallos en la cadena real.
-            logger.exception("Fallo al ejecutar la cadena con historial parcial: %s", exc)
-
-    if result is None:
-        result = qa_chain(
-            {
-                "query": payload.question,
-                "chat_history": chat_history,
-                "chat_history_text": chat_history_text,
-            }
-        )
+    result = await run_in_threadpool(
+        _execute_qa_chain,
+        payload.question,
+        chat_history,
+        chat_history_text,
+    )
     answer = result.get("result", "No answer generated.")
 
     source_docs = result.get("source_documents", [])
@@ -533,7 +555,13 @@ def ask_question(payload: AskRequest) -> AskResponse:
     # el backend compartido. ``append_turn`` usa operaciones atómicas (RPUSH +
     # LTRIM) para evitar condiciones de carrera entre múltiples peticiones.
     try:
-        conversation_store.append_turn(payload.user_id, conversation_id, payload.question, answer)
+        await run_in_threadpool(
+            conversation_store.append_turn,
+            payload.user_id,
+            conversation_id,
+            payload.question,
+            answer,
+        )
     except ConversationStoreError as exc:
         logger.error("Fallo al guardar el historial: %s", exc)
         raise HTTPException(status_code=503, detail="Failed to persist conversation history.") from exc
