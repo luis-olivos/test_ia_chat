@@ -124,6 +124,40 @@ def _install_stub_modules() -> None:
     sys.modules["redis"] = redis_module
     sys.modules["redis.exceptions"] = redis_exceptions
 
+    # prometheus_client
+    prometheus_client = ModuleType("prometheus_client")
+
+    class _Histogram:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def observe(self, *args, **kwargs):
+            pass
+
+    class _Counter:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def inc(self, *args, **kwargs):
+            pass
+
+    class _Gauge:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def set(self, *args, **kwargs):
+            pass
+
+    def _generate_latest():
+        return b""
+
+    prometheus_client.Histogram = _Histogram
+    prometheus_client.Counter = _Counter
+    prometheus_client.Gauge = _Gauge
+    prometheus_client.generate_latest = _generate_latest
+    prometheus_client.CONTENT_TYPE_LATEST = "text/plain"
+    sys.modules["prometheus_client"] = prometheus_client
+
 
 _install_stub_modules()
 

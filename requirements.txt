@@ -6,3 +6,4 @@ chromadb
 PyPDF2
 pydantic
 redis
+prometheus-client
