@@ -67,6 +67,9 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")  # Must be set externally before ru
 # en producción basta con definir la variable de entorno ``REDIS_URL`` con la
 # cadena de conexión adecuada.
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+# Tiempo que se mantendrán las respuestas cacheadas. Un valor bajo reduce la
+# presión sobre el LLM cuando se repiten preguntas idénticas.
+QA_CACHE_TTL_SECONDS = _read_positive_int("QA_CACHE_TTL_SECONDS", default=300)
 # Máximo de turnos que se conservarán por conversación en el backend. No tiene
 # por qué coincidir con ``MAX_HISTORY_TURNS`` porque aquí controlamos cuánto
 # historial completo queremos persistir.
@@ -91,6 +94,14 @@ qa_chain: RetrievalQA | None = None
 # usuario y conversación. Esto permite que múltiples instancias del servidor
 # compartan contexto sin depender de memoria local.
 conversation_store: "ConversationStore" | None = None
+# ``response_cache`` almacena respuestas recientes para evitar recalcularlas en
+# cada petición cuando el usuario repite exactamente la misma consulta.
+response_cache: "ResponseCache" | None = None
+
+# Índice auxiliar que relaciona nombres de archivos PDF con la ruta completa
+# guardada en los metadatos. Sirve para realizar filtros sencillos antes de
+# consultar el índice vectorial.
+DOCUMENT_SOURCE_INDEX: dict[str, str] = {}
 
 
 class ConversationStore(Protocol):
@@ -197,21 +208,109 @@ class InMemoryConversationStore:
         self._storage.clear()
 
 
-def create_conversation_store() -> ConversationStore:
-    """Inicializa el backend de historiales compartido usando Redis."""
+class ResponseCache(Protocol):
+    """Interfaz mínima para los backends de caché de respuestas."""
 
+    def get(self, user_id: str, normalized_question: str) -> Tuple[str, List[str]] | None:
+        ...
+
+    def set(
+        self,
+        user_id: str,
+        normalized_question: str,
+        answer: str,
+        context: List[str],
+    ) -> None:
+        ...
+
+
+class ResponseCacheError(RuntimeError):
+    """Indica fallos al interactuar con el backend de caché."""
+
+
+class RedisResponseCache:
+    """Caché ligera de respuestas basada en Redis."""
+
+    def __init__(self, client: Redis, *, ttl_seconds: int) -> None:
+        self._client = client
+        self._ttl_seconds = ttl_seconds
+
+    @staticmethod
+    def _build_key(user_id: str, normalized_question: str) -> str:
+        return f"qa-cache:{user_id}:{normalized_question}"
+
+    def get(self, user_id: str, normalized_question: str) -> Tuple[str, List[str]] | None:
+        key = self._build_key(user_id, normalized_question)
+        try:
+            payload = self._client.get(key)
+        except RedisError as exc:  # pragma: no cover - solo ante fallos de red.
+            raise ResponseCacheError("No fue posible recuperar la respuesta en caché.") from exc
+
+        if not payload:
+            return None
+
+        try:
+            data = json.loads(payload)
+        except json.JSONDecodeError:
+            logger.warning("Entrada de caché dañada en Redis para %s", key)
+            return None
+
+        answer = data.get("answer")
+        context = data.get("context")
+        if not isinstance(answer, str) or not isinstance(context, list):
+            logger.warning("Formato inesperado en la caché para %s", key)
+            return None
+
+        sanitized_context = [str(item) for item in context]
+        return answer, sanitized_context
+
+    def set(
+        self,
+        user_id: str,
+        normalized_question: str,
+        answer: str,
+        context: List[str],
+    ) -> None:
+        key = self._build_key(user_id, normalized_question)
+        payload = json.dumps({"answer": answer, "context": context}, ensure_ascii=False)
+        try:
+            self._client.setex(key, self._ttl_seconds, payload)
+        except RedisError as exc:  # pragma: no cover - solo ante fallos de red.
+            raise ResponseCacheError("No fue posible guardar la respuesta en caché.") from exc
+
+
+def _create_redis_client() -> Redis:
     try:
         client = Redis.from_url(REDIS_URL, decode_responses=True)
-        # ``ping`` fuerza una conexión temprana y falla rápido si Redis no está disponible.
         client.ping()
     except RedisError as exc:  # pragma: no cover - se activa solo si Redis está caído.
         raise ConversationStoreError("No se pudo conectar a Redis para el historial de chats.") from exc
+    return client
 
+
+def create_conversation_store() -> ConversationStore:
+    """Inicializa el backend de historiales compartido usando Redis."""
+
+    client = _create_redis_client()
     return RedisConversationStore(
         client,
         max_length=MAX_STORED_TURNS,
         ttl_seconds=HISTORY_TTL_SECONDS,
     )
+
+
+def create_response_cache() -> ResponseCache | None:
+    """Crea la caché de respuestas si la configuración lo permite."""
+
+    if QA_CACHE_TTL_SECONDS is None:
+        return None
+
+    try:
+        client = _create_redis_client()
+    except ConversationStoreError as exc:
+        raise ResponseCacheError("No se pudo conectar a Redis para la caché de respuestas.") from exc
+
+    return RedisResponseCache(client, ttl_seconds=QA_CACHE_TTL_SECONDS)
 
 # Número máximo de turnos previos que se incluirán al condensar el historial
 # de chat. Mantenerlo acotado evita que el prompt crezca sin control mientras
@@ -411,6 +510,68 @@ def summarize_chat_history(chat_history: ConversationHistory, max_turns: int = M
     return "\n".join(lines)
 
 
+def normalize_question(question: str) -> str:
+    """Devuelve una forma canónica de la pregunta para reutilizarla en claves."""
+
+    return " ".join(question.strip().lower().split())
+
+
+def _discover_document_sources(pdf_dir: str) -> dict[str, str]:
+    """Crea un índice rápido de PDF disponibles para filtros por metadatos."""
+
+    index: dict[str, str] = {}
+    for path in glob.glob(os.path.join(pdf_dir, "**", "*.pdf"), recursive=True):
+        name = Path(path).stem
+        normalized_name = normalize_question(name.replace("_", " ").replace("-", " "))
+        if normalized_name:
+            index[normalized_name] = path
+    return index
+
+
+def _select_metadata_filter(normalized_question: str) -> dict[str, str] | None:
+    """Devuelve un filtro por metadatos si la pregunta cita un PDF concreto."""
+
+    if not DOCUMENT_SOURCE_INDEX:
+        return None
+
+    matches = [
+        source_path
+        for name, source_path in DOCUMENT_SOURCE_INDEX.items()
+        if name and name in normalized_question
+    ]
+
+    if not matches:
+        return None
+
+    for source_path in sorted(set(matches), key=len, reverse=True):
+        return {"source": source_path}
+    return None
+
+
+def _calculate_dynamic_k(question: str) -> int:
+    """Ajusta el número de documentos recuperados según la longitud de la consulta."""
+
+    word_count = len(question.split())
+    if word_count <= 5:
+        return 2
+    if word_count <= 15:
+        return 4
+    if word_count <= 40:
+        return 6
+    return 8
+
+
+def _build_search_kwargs(question: str) -> dict[str, object]:
+    """Calcula parámetros dinámicos para el retriever de LangChain."""
+
+    normalized = normalize_question(question)
+    search_kwargs: dict[str, object] = {"k": _calculate_dynamic_k(question)}
+    metadata_filter = _select_metadata_filter(normalized)
+    if metadata_filter:
+        search_kwargs["filter"] = metadata_filter
+    return search_kwargs
+
+
 @app.on_event("startup")
 def on_startup() -> None:
     """FastAPI startup hook to prepare the LangChain pipeline once when the server launches."""
@@ -418,8 +579,14 @@ def on_startup() -> None:
     # FastAPI ejecuta esta función automáticamente al iniciar el servidor.
     # Construir el ``qa_chain`` aquí garantiza que los recursos pesados (lectura
     # de PDF, generación de embeddings, etc.) se realicen una única vez.
-    global qa_chain, conversation_store
+    global qa_chain, conversation_store, response_cache, DOCUMENT_SOURCE_INDEX
     conversation_store = create_conversation_store()
+    try:
+        response_cache = create_response_cache()
+    except ResponseCacheError as exc:
+        logger.warning("No se pudo inicializar la caché de respuestas: %s", exc)
+        response_cache = None
+    DOCUMENT_SOURCE_INDEX = _discover_document_sources(PDF_FOLDER)
     qa_chain = initialize_qa_chain()
 
 
@@ -443,7 +610,27 @@ def _execute_qa_chain(
             retriever = getattr(qa_chain, "retriever", None)
 
             if retriever is not None and hasattr(retriever, "get_relevant_documents"):
-                source_docs = retriever.get_relevant_documents(question)
+                search_kwargs = _build_search_kwargs(question)
+                vector_store = getattr(retriever, "vectorstore", None)
+                if vector_store is not None and hasattr(vector_store, "similarity_search"):
+                    source_docs = vector_store.similarity_search(
+                        question,
+                        k=int(search_kwargs.get("k", 4)),
+                        filter=search_kwargs.get("filter"),
+                    )
+                else:
+                    original_kwargs = getattr(retriever, "search_kwargs", None)
+                    merged_kwargs = {}
+                    if isinstance(original_kwargs, dict):
+                        merged_kwargs.update(original_kwargs)
+                    merged_kwargs.update(search_kwargs)
+                    if hasattr(retriever, "search_kwargs"):
+                        retriever.search_kwargs = merged_kwargs  # type: ignore[attr-defined]
+                    try:
+                        source_docs = retriever.get_relevant_documents(question)
+                    finally:
+                        if hasattr(retriever, "search_kwargs"):
+                            retriever.search_kwargs = original_kwargs  # type: ignore[attr-defined]
                 context = "\n\n".join((doc.page_content or "") for doc in source_docs)
                 answer_text = llm_with_history.run(
                     context=context,
@@ -483,8 +670,40 @@ async def ask_question(payload: AskRequest) -> AskResponse:
     # Normaliza el identificador de conversación. Si el cliente no especifica
     # uno, se utiliza "default" para agrupar todas las preguntas de ese usuario.
     conversation_id = payload.conversation_id or "default"
+    normalized_question = normalize_question(payload.question)
     if conversation_store is None:
         raise HTTPException(status_code=503, detail="Conversation store is not ready yet.")
+
+    cached_entry: Tuple[str, List[str]] | None = None
+    if response_cache is not None:
+        try:
+            cached_entry = await run_in_threadpool(
+                response_cache.get,
+                payload.user_id,
+                normalized_question,
+            )
+        except ResponseCacheError as exc:
+            logger.warning("No se pudo consultar la caché de respuestas: %s", exc)
+
+    if cached_entry is not None:
+        answer, cached_context = cached_entry
+        try:
+            await run_in_threadpool(
+                conversation_store.append_turn,
+                payload.user_id,
+                conversation_id,
+                payload.question,
+                answer,
+            )
+        except ConversationStoreError as exc:
+            logger.error("Fallo al guardar el historial (respuesta en caché): %s", exc)
+            raise HTTPException(status_code=503, detail="Failed to persist conversation history.") from exc
+
+        return AskResponse(
+            answer=answer,
+            context=cached_context,
+            conversation_id=conversation_id,
+        )
 
     try:
         # Se recupera el historial desde Redis para que todos los workers
@@ -565,6 +784,18 @@ async def ask_question(payload: AskRequest) -> AskResponse:
     except ConversationStoreError as exc:
         logger.error("Fallo al guardar el historial: %s", exc)
         raise HTTPException(status_code=503, detail="Failed to persist conversation history.") from exc
+
+    if response_cache is not None:
+        try:
+            await run_in_threadpool(
+                response_cache.set,
+                payload.user_id,
+                normalized_question,
+                answer,
+                context_snippets,
+            )
+        except ResponseCacheError as exc:
+            logger.warning("No se pudo guardar la respuesta en caché: %s", exc)
 
     return AskResponse(
         answer=answer,

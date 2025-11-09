@@ -167,6 +167,7 @@ def test_client(monkeypatch):
 
     store = main.InMemoryConversationStore(max_length=main.MAX_STORED_TURNS)
     monkeypatch.setattr(main, "create_conversation_store", lambda: store)
+    monkeypatch.setattr(main, "create_response_cache", lambda: None)
     main._dummy_store = store  # type: ignore[attr-defined]
 
     with TestClient(main.app) as client:
@@ -176,6 +177,8 @@ def test_client(monkeypatch):
     if hasattr(main, "_dummy_store"):
         main._dummy_store.clear()  # type: ignore[attr-defined]
     main.conversation_store = None
+    main.response_cache = None
+    main.DOCUMENT_SOURCE_INDEX = {}
 
 
 def test_ask_question_deduplicates_sources(test_client):
