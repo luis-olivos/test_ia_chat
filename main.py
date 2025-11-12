@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Callable, List, Protocol, Tuple, TypeVar
 
 from fastapi import FastAPI, HTTPException, Response
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
@@ -158,6 +159,20 @@ CHAT_HISTORY_TRUNCATIONS_TOTAL = Counter(
 )
 
 app = FastAPI(title="PDF Question Answering API")
+
+allowed_origins_raw = os.getenv("ALLOWED_ORIGINS", "*")
+if allowed_origins_raw.strip() == "*":
+    allowed_origins = ["*"]
+else:
+    allowed_origins = [origin.strip() for origin in allowed_origins_raw.split(",") if origin.strip()]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allowed_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ``qa_chain`` se inicializa en ``None`` y posteriormente se rellenará en el
 # evento de inicio de FastAPI. Usar una variable global evita reconstruir toda la
@@ -1058,6 +1073,13 @@ def root() -> dict[str, str]:
     # Responder con un objeto simple permite a servicios externos verificar que
     # la API está viva sin ejecutar el proceso completo de pregunta/respuesta.
     return {"status": "ok"}
+
+
+@app.get("/tu_ruta")
+def example_route() -> dict[str, str]:
+    """Endpoint adicional para responder a peticiones GET de prueba."""
+
+    return {"message": "Solicitud recibida correctamente"}
 
 
 if __name__ == "__main__":
