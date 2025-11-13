@@ -5,16 +5,22 @@ import glob
 import json
 import logging
 import os
+import re
 import time
+import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+from html import unescape
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Callable, List, Protocol, Tuple, TypeVar
+from urllib.parse import urljoin, urlparse
 
 from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
+import requests
 from langchain_classic.chains import RetrievalQA
 from langchain_core.documents import Document
 from langchain_core.prompts import PromptTemplate
@@ -79,6 +85,13 @@ PDF_FOLDER = os.getenv("PDF_FOLDER", "pdfs")
 # Ubicación donde se guardará el índice vectorial que utiliza Chroma para
 # realizar búsquedas semánticas rápidas sobre los documentos cargados.
 CHROMA_DIR = os.getenv("CHROMA_DIR", "chroma_store")
+# Configuración para complementar la información con la documentación oficial.
+HALCONET_DOCS_BASE_URL = os.getenv("HALCONET_DOCS_BASE_URL", "https://docs.halconet.com")
+HALCONET_DOCS_SITEMAP_PATH = os.getenv("HALCONET_DOCS_SITEMAP_PATH", "sitemap.xml")
+HALCONET_DOCS_MAX_PAGES = _read_positive_int("HALCONET_DOCS_MAX_PAGES", default=50)
+HALCONET_DOCS_TIMEOUT_SECONDS = _read_non_negative_float(
+    "HALCONET_DOCS_TIMEOUT_SECONDS", default=10.0
+)
 # Clave de acceso para el servicio Gemini de Google. Es obligatoria y debe
 # proporcionarse fuera del código (por motivos de seguridad) antes de arrancar
 # la API.
@@ -477,6 +490,227 @@ def load_pdf_documents(pdf_dir: str) -> List[Document]:
                         metadata={"source": path, "page": page_number + 1},
                     )
                 )
+    return documents
+
+
+class _HTMLTextExtractor(HTMLParser):
+    """Minimal HTML to text converter tailored to documentation pages."""
+
+    _BLOCK_TAGS = {"p", "li", "h1", "h2", "h3", "h4", "h5", "h6", "pre", "code"}
+    _BREAK_TAGS = {"br"}
+    _IGNORED_TAGS = {"script", "style", "noscript"}
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._chunks: list[str] = []
+        self._ignored_depth = 0
+        self._capture_heading = False
+        self.first_heading: str | None = None
+
+    def handle_starttag(self, tag: str, attrs) -> None:  # type: ignore[override]
+        if tag in self._IGNORED_TAGS:
+            self._ignored_depth += 1
+            return
+
+        if self._ignored_depth:
+            return
+
+        if tag in self._BLOCK_TAGS:
+            self._chunks.append("\n")
+        elif tag in self._BREAK_TAGS:
+            self._chunks.append("\n")
+
+        if tag in {"h1", "h2"} and self.first_heading is None:
+            self._capture_heading = True
+
+    def handle_endtag(self, tag: str) -> None:  # type: ignore[override]
+        if tag in self._IGNORED_TAGS:
+            if self._ignored_depth:
+                self._ignored_depth -= 1
+            return
+
+        if self._ignored_depth:
+            return
+
+        if tag in self._BLOCK_TAGS:
+            self._chunks.append("\n")
+        elif tag in self._BREAK_TAGS:
+            self._chunks.append("\n")
+
+        if tag in {"h1", "h2"} and self._capture_heading:
+            self._capture_heading = False
+
+    def handle_data(self, data: str) -> None:  # type: ignore[override]
+        if self._ignored_depth:
+            return
+
+        text = data.strip()
+        if not text:
+            return
+
+        self._chunks.append(text + " ")
+        if self._capture_heading and self.first_heading is None:
+            self.first_heading = text
+
+    def handle_startendtag(self, tag: str, attrs) -> None:  # type: ignore[override]
+        if tag in self._BREAK_TAGS and not self._ignored_depth:
+            self._chunks.append("\n")
+
+    def get_text(self) -> tuple[str, str | None]:
+        raw_text = "".join(self._chunks)
+        normalized = unescape(raw_text)
+        normalized = re.sub(r"[ \t]+\n", "\n", normalized)
+        normalized = re.sub(r"\n{3,}", "\n\n", normalized)
+        normalized = re.sub(r"\s+", lambda match: " " if "\n" not in match.group(0) else match.group(0), normalized)
+        cleaned = normalized.strip()
+        heading = self.first_heading.strip() if self.first_heading else None
+        return cleaned, heading
+
+
+def _parse_sitemap_urls(content: str) -> List[str]:
+    """Extract URL list from a sitemap XML payload."""
+
+    try:
+        root = ET.fromstring(content)
+    except ET.ParseError as exc:
+        logger.warning("No se pudo analizar el sitemap de Halconet: %s", exc)
+        return []
+
+    namespace = ""
+    if root.tag.startswith("{"):
+        namespace = root.tag.split("}", 1)[0][1:]
+
+    def _findall(tag: str) -> List[ET.Element]:
+        if namespace:
+            return root.findall(f".//{{{namespace}}}{tag}")
+        return root.findall(f".//{tag}")
+
+    urls = []
+    for loc in _findall("loc"):
+        if loc.text:
+            url = loc.text.strip()
+            if url:
+                urls.append(url)
+    return urls
+
+
+def _derive_section_from_url(url: str) -> str | None:
+    """Return a human readable section name based on the URL path."""
+
+    parsed = urlparse(url)
+    path = parsed.path or ""
+    slug = path.rstrip("/").split("/")[-1]
+    if not slug:
+        return None
+    readable = slug.replace("-", " ").strip()
+    if not readable:
+        return None
+    return readable.title()
+
+
+def _extract_text_and_heading(html: str) -> tuple[str, str | None]:
+    parser = _HTMLTextExtractor()
+    parser.feed(html)
+    parser.close()
+    return parser.get_text()
+
+
+def load_halconet_documents(
+    base_url: str | None = None,
+    *,
+    session: requests.Session | None = None,
+) -> List[Document]:
+    """Download and convert Halconet documentation pages into LangChain Documents."""
+
+    configured_base = (base_url or HALCONET_DOCS_BASE_URL or "").strip()
+    if not configured_base:
+        return []
+
+    normalized_base = configured_base if configured_base.endswith("/") else configured_base + "/"
+    sitemap_path = (HALCONET_DOCS_SITEMAP_PATH or "sitemap.xml").strip()
+    sitemap_url = urljoin(normalized_base, sitemap_path)
+
+    http_session = session or requests.Session()
+    timeout = HALCONET_DOCS_TIMEOUT_SECONDS or 10.0
+
+    try:
+        sitemap_response = http_session.get(sitemap_url, timeout=timeout)
+        sitemap_response.raise_for_status()
+    except requests.RequestException as exc:
+        logger.warning("No se pudo descargar el sitemap de Halconet (%s): %s", sitemap_url, exc)
+        return []
+
+    raw_urls = _parse_sitemap_urls(sitemap_response.text)
+    if not raw_urls:
+        return []
+
+    parsed_base = urlparse(normalized_base)
+    allowed_netloc = parsed_base.netloc
+    allowed_scheme = parsed_base.scheme or "https"
+
+    filtered_urls: list[str] = []
+    seen: set[str] = set()
+    for raw_url in raw_urls:
+        parsed = urlparse(raw_url)
+        if parsed.scheme not in {"http", "https", ""}:
+            continue
+        if parsed.netloc and parsed.netloc != allowed_netloc:
+            continue
+
+        absolute_url = raw_url
+        if not parsed.netloc:
+            absolute_url = urljoin(normalized_base, raw_url)
+            parsed = urlparse(absolute_url)
+
+        if not parsed.scheme:
+            absolute_url = f"{allowed_scheme}://{allowed_netloc}{parsed.path}"
+            parsed = urlparse(absolute_url)
+
+        normalized_url = absolute_url.rstrip("/")
+        if normalized_url in seen:
+            continue
+
+        seen.add(normalized_url)
+        filtered_urls.append(absolute_url)
+
+    max_pages = HALCONET_DOCS_MAX_PAGES
+    documents: List[Document] = []
+    for idx, page_url in enumerate(filtered_urls):
+        if max_pages is not None and idx >= max_pages:
+            break
+
+        try:
+            page_response = http_session.get(page_url, timeout=timeout)
+            page_response.raise_for_status()
+        except requests.RequestException as exc:
+            logger.info("No se pudo descargar la página de documentación %s: %s", page_url, exc)
+            continue
+
+        text, heading = _extract_text_and_heading(page_response.text)
+        if not text:
+            continue
+
+        section = heading or _derive_section_from_url(page_url)
+        documents.append(
+            Document(
+                page_content=text,
+                metadata={
+                    "source": page_url,
+                    "section": section,
+                    "origin": "halconet_docs",
+                },
+            )
+        )
+
+    return documents
+
+
+def load_all_documents(pdf_dir: str, *, include_halconet_docs: bool = True) -> List[Document]:
+    """Combine local PDF documents with Halconet's online documentation."""
+
+    documents = load_pdf_documents(pdf_dir)
+    if include_halconet_docs:
+        documents.extend(load_halconet_documents())
     return documents
 
 
@@ -1011,6 +1245,7 @@ async def ask_question(payload: AskRequest) -> AskResponse:
         metadata = doc.metadata or {}
         source = metadata.get("source", "unknown source")
         page = metadata.get("page")
+        section = metadata.get("section")
 
         # Normalize the snippet content so duplicates can be filtered reliably.
         page_content = (doc.page_content or "").strip()
@@ -1022,8 +1257,12 @@ async def ask_question(payload: AskRequest) -> AskResponse:
         # para evitar duplicados. Si no está disponible, utilizamos el contenido
         # del fragmento como alternativa.
         if page in (None, ""):
-            dedupe_key = (source, page_content)
-            page_display = "?"
+            if section:
+                dedupe_key = (source, section)
+                page_display = section
+            else:
+                dedupe_key = (source, page_content)
+                page_display = "?"
         else:
             dedupe_key = (source, page)
             page_display = page

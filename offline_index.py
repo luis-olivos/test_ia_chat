@@ -7,13 +7,13 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from main import CHROMA_DIR, PDF_FOLDER, build_vector_store, load_pdf_documents
+from main import CHROMA_DIR, PDF_FOLDER, build_vector_store, load_all_documents
 
 
 def generate_index(pdf_folder: str, chroma_dir: str, recreate: bool = True) -> None:
     """Generate embeddings for all PDFs and persist them into ``chroma_dir``."""
 
-    documents = load_pdf_documents(pdf_folder)
+    documents = load_all_documents(pdf_folder)
     if not documents:
         raise RuntimeError(
             f"No PDF documents found in '{pdf_folder}'. Add PDFs before generating the index."
