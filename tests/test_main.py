@@ -1,9 +1,10 @@
-from pathlib import Path
 import sys
 from types import ModuleType
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -285,3 +286,55 @@ def test_follow_up_question_uses_chat_history(test_client):
     assert response2.json()["answer"] == "Es azul."
 
     chain.handler = None
+
+
+class _DummyResponse:
+    def __init__(self, text: str, status_code: int = 200):
+        self.text = text
+        self.status_code = status_code
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise requests.HTTPError(f"status {self.status_code}")
+
+
+class _DummySession:
+    def __init__(self, sitemap_payload: str, page_payload: str, status_code: int = 200):
+        self._sitemap_payload = sitemap_payload
+        self._page_payload = page_payload
+        self._status_code = status_code
+        self.calls = []
+
+    def get(self, url: str, timeout: float):
+        self.calls.append((url, timeout))
+        if url.endswith("sitemap.xml"):
+            return _DummyResponse(self._sitemap_payload, status_code=self._status_code)
+        return _DummyResponse(self._page_payload, status_code=self._status_code)
+
+
+def test_load_halconet_documents_parses_pages():
+    sitemap = (
+        "<?xml version='1.0' encoding='UTF-8'?>"
+        "<urlset xmlns='http://www.sitemaps.org/schemas/sitemap/0.9'>"
+        "<url><loc>https://docs.halconet.com/intro</loc></url>"
+        "</urlset>"
+    )
+    html = "<html><body><h1>Bienvenida</h1><p>Contenido principal.</p></body></html>"
+    session = _DummySession(sitemap, html)
+
+    documents = main.load_halconet_documents(base_url="https://docs.halconet.com", session=session)
+
+    assert len(documents) == 1
+    doc = documents[0]
+    assert doc.metadata["source"] == "https://docs.halconet.com/intro"
+    assert "Contenido principal" in doc.page_content
+    assert doc.metadata["section"] in {"Bienvenida", "Intro"}
+
+
+def test_load_halconet_documents_handles_errors():
+    class _FailingSession:
+        def get(self, url: str, timeout: float):  # pragma: no cover - simple stub
+            raise requests.RequestException("boom")
+
+    documents = main.load_halconet_documents(base_url="https://docs.halconet.com", session=_FailingSession())
+    assert documents == []
