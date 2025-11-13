@@ -641,14 +641,15 @@ def load_halconet_documents(
     candidate_paths: list[str] = []
     if configured_sitemap:
         candidate_paths.append(configured_sitemap)
-    for fallback in ("sitemap_index.xml"):
-        if fallback not in candidate_paths:
+    for fallback in ("sitemap_index.xml", "sitemap.xml"):
+        if fallback and fallback not in candidate_paths:
             candidate_paths.append(fallback)
-    
+
     http_session = session or requests.Session()
     timeout = HALCONET_DOCS_TIMEOUT_SECONDS or 10.0
 
     sitemap_text: str | None = None
+    raw_urls: list[str] = []
     for path in candidate_paths:
         candidate_url = urljoin(normalized_base, path)
         try:
@@ -660,8 +661,11 @@ def load_halconet_documents(
             )
             continue
 
-        sitemap_text = sitemap_response.text
-        break
+        candidate_text = sitemap_response.text
+        raw_urls = _parse_sitemap_urls(candidate_text)
+        if raw_urls:
+            sitemap_text = candidate_text
+            break
 
     if sitemap_text is None:
         logger.warning(
@@ -670,7 +674,6 @@ def load_halconet_documents(
         )
         return []
 
-    raw_urls = _parse_sitemap_urls(sitemap_text)
     if not raw_urls:
         return []
 
@@ -678,30 +681,84 @@ def load_halconet_documents(
     allowed_netloc = parsed_base.netloc
     allowed_scheme = parsed_base.scheme or "https"
 
-    filtered_urls: list[str] = []
-    seen: set[str] = set()
-    for raw_url in raw_urls:
-        parsed = urlparse(raw_url)
-        if parsed.scheme not in {"http", "https", ""}:
-            continue
-        if parsed.netloc and parsed.netloc != allowed_netloc:
-            continue
+    def _normalize_url(raw: str) -> str | None:
+        raw = raw.strip()
+        if not raw:
+            return None
 
-        absolute_url = raw_url
+        parsed = urlparse(raw)
+        if parsed.scheme not in {"http", "https", ""}:
+            return None
+        if parsed.netloc and parsed.netloc != allowed_netloc:
+            return None
+
         if not parsed.netloc:
-            absolute_url = urljoin(normalized_base, raw_url)
-            parsed = urlparse(absolute_url)
+            parsed = urlparse(urljoin(normalized_base, raw))
 
         if not parsed.scheme:
-            absolute_url = f"{allowed_scheme}://{allowed_netloc}{parsed.path}"
-            parsed = urlparse(absolute_url)
+            parsed = parsed._replace(scheme=allowed_scheme)
+        if not parsed.netloc:
+            parsed = parsed._replace(netloc=allowed_netloc)
 
-        normalized_url = absolute_url.rstrip("/")
-        if normalized_url in seen:
+        normalized = parsed._replace(fragment="")
+        normalized_url = normalized.geturl().rstrip("/")
+        return normalized_url
+
+    filtered_urls: list[str] = []
+    seen_urls: set[str] = set()
+    pending_urls: list[str] = list(raw_urls)
+    seen_sitemaps: set[str] = set()
+
+    while pending_urls:
+        candidate = pending_urls.pop(0)
+        normalized_candidate = _normalize_url(candidate)
+        if not normalized_candidate:
             continue
 
-        seen.add(normalized_url)
-        filtered_urls.append(absolute_url)
+        parsed_candidate = urlparse(normalized_candidate)
+
+        if parsed_candidate.path.lower().endswith(".xml") or "sitemap" in parsed_candidate.path.lower():
+            if normalized_candidate in seen_sitemaps:
+                continue
+            seen_sitemaps.add(normalized_candidate)
+
+            try:
+                nested_response = http_session.get(normalized_candidate, timeout=timeout)
+                nested_response.raise_for_status()
+            except requests.RequestException as exc:
+                logger.info(
+                    "No se pudo descargar el sitemap anidado %s: %s",
+                    normalized_candidate,
+                    exc,
+                )
+                continue
+
+            headers = getattr(nested_response, "headers", {})
+            content_type = ""
+            if isinstance(headers, dict):
+                content_type = str(headers.get("Content-Type", ""))
+            elif headers:
+                content_type = str(headers)
+            content_type = content_type.lower()
+            response_text = nested_response.text
+            looks_like_xml = "xml" in content_type or response_text.lstrip().startswith("<?xml")
+            if not looks_like_xml:
+                # Algunos servidores no etiquetan correctamente el contenido.
+                # Si no parece XML, asumimos que es una página HTML normal.
+                if normalized_candidate not in seen_urls:
+                    seen_urls.add(normalized_candidate)
+                    filtered_urls.append(normalized_candidate)
+                continue
+
+            nested_urls = _parse_sitemap_urls(response_text)
+            pending_urls.extend(nested_urls)
+            continue
+
+        if normalized_candidate in seen_urls:
+            continue
+
+        seen_urls.add(normalized_candidate)
+        filtered_urls.append(normalized_candidate)
 
     max_pages = HALCONET_DOCS_MAX_PAGES
     documents: List[Document] = []
