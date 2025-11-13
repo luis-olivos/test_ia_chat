@@ -627,20 +627,45 @@ def load_halconet_documents(
         return []
 
     normalized_base = configured_base if configured_base.endswith("/") else configured_base + "/"
-    sitemap_path = (HALCONET_DOCS_SITEMAP_PATH or "sitemap.xml").strip()
-    sitemap_url = urljoin(normalized_base, sitemap_path)
+    configured_sitemap = (HALCONET_DOCS_SITEMAP_PATH or "sitemap.xml").strip()
+
+    # Algunos sitios de documentación (especialmente los basados en WordPress)
+    # exponen el sitemap en rutas diferentes. Probamos la ruta configurada y un
+    # conjunto pequeño de alternativas comunes antes de rendirnos. Esto evita que
+    # un cambio menor en la URL rompa por completo la carga de documentación.
+    candidate_paths: list[str] = []
+    if configured_sitemap:
+        candidate_paths.append(configured_sitemap)
+    for fallback in ("sitemap.xml", "sitemap_index.xml", "wp-sitemap.xml"):
+        if fallback not in candidate_paths:
+            candidate_paths.append(fallback)
 
     http_session = session or requests.Session()
     timeout = HALCONET_DOCS_TIMEOUT_SECONDS or 10.0
 
-    try:
-        sitemap_response = http_session.get(sitemap_url, timeout=timeout)
-        sitemap_response.raise_for_status()
-    except requests.RequestException as exc:
-        logger.warning("No se pudo descargar el sitemap de Halconet (%s): %s", sitemap_url, exc)
+    sitemap_text: str | None = None
+    for path in candidate_paths:
+        candidate_url = urljoin(normalized_base, path)
+        try:
+            sitemap_response = http_session.get(candidate_url, timeout=timeout)
+            sitemap_response.raise_for_status()
+        except requests.RequestException as exc:
+            logger.info(
+                "No se pudo descargar el sitemap de Halconet en %s: %s", candidate_url, exc
+            )
+            continue
+
+        sitemap_text = sitemap_response.text
+        break
+
+    if sitemap_text is None:
+        logger.warning(
+            "No se encontró un sitemap válido de Halconet tras probar: %s",
+            ", ".join(urljoin(normalized_base, path) for path in candidate_paths),
+        )
         return []
 
-    raw_urls = _parse_sitemap_urls(sitemap_response.text)
+    raw_urls = _parse_sitemap_urls(sitemap_text)
     if not raw_urls:
         return []
 
