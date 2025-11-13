@@ -160,18 +160,30 @@ CHAT_HISTORY_TRUNCATIONS_TOTAL = Counter(
 
 app = FastAPI(title="PDF Question Answering API")
 
-allowed_origins_raw = os.getenv("ALLOWED_ORIGINS", "*")
-if allowed_origins_raw.strip() == "*":
-    allowed_origins = ["*"]
+default_allowed_origins = {
+    "http://localhost:51635",
+    "http://127.0.0.1:51635",
+}
+allowed_origins_raw = os.getenv("ALLOWED_ORIGINS")
+if allowed_origins_raw and allowed_origins_raw.strip() != "*":
+    parsed_origins = {
+        origin.strip()
+        for origin in allowed_origins_raw.split(",")
+        if origin.strip()
+    }
+    allowed_origins = sorted(parsed_origins | default_allowed_origins)
 else:
-    allowed_origins = [origin.strip() for origin in allowed_origins_raw.split(",") if origin.strip()]
+    allowed_origins = sorted(default_allowed_origins)
+
+allowed_methods = ["GET", "POST", "OPTIONS"]
+allowed_headers = ["Content-Type", "Accept"]
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=allowed_methods,
+    allow_headers=allowed_headers,
 )
 
 # ``qa_chain`` se inicializa en ``None`` y posteriormente se rellenará en el
