@@ -92,7 +92,7 @@ PDF_FOLDER = os.getenv("PDF_FOLDER", "pdfs")
 CHROMA_DIR = os.getenv("CHROMA_DIR", "chroma_store")
 # Configuración para complementar la información con la documentación oficial.
 HALCONET_DOCS_BASE_URL = os.getenv("HALCONET_DOCS_BASE_URL", "https://docs.halconet.com")
-HALCONET_DOCS_SITEMAP_PATH = os.getenv("HALCONET_DOCS_SITEMAP_PATH", "sitemap.xml")
+HALCONET_DOCS_SITEMAP_PATH = os.getenv("HALCONET_DOCS_SITEMAP_PATH", "sitemap_index.xml")
 HALCONET_DOCS_MAX_PAGES = _read_positive_int("HALCONET_DOCS_MAX_PAGES", default=50)
 HALCONET_DOCS_TIMEOUT_SECONDS = _read_non_negative_float(
     "HALCONET_DOCS_TIMEOUT_SECONDS", default=10.0
@@ -641,10 +641,10 @@ def load_halconet_documents(
     candidate_paths: list[str] = []
     if configured_sitemap:
         candidate_paths.append(configured_sitemap)
-    for fallback in ("sitemap.xml", "sitemap_index.xml", "wp-sitemap.xml"):
+    for fallback in ("sitemap_index.xml"):
         if fallback not in candidate_paths:
             candidate_paths.append(fallback)
-
+    
     http_session = session or requests.Session()
     timeout = HALCONET_DOCS_TIMEOUT_SECONDS or 10.0
 
@@ -802,7 +802,7 @@ def build_vector_store(
             time.sleep(sleep_seconds)
             attempt += 1
 
-    vector_store.persist()
+    ##vector_store.persist()
     return vector_store
 
 
