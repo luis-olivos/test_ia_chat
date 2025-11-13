@@ -27,6 +27,11 @@ from langchain_core.prompts import PromptTemplate
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+
+try:  # pragma: no cover - import path depends on package layout.
+    from langchain_google_genai._common import GoogleGenerativeAIError
+except (ImportError, ModuleNotFoundError):  # pragma: no cover - fallback for minimal installs.
+    GoogleGenerativeAIError = Exception  # type: ignore[assignment]
 from PyPDF2 import PdfReader
 from dotenv import load_dotenv
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
@@ -753,6 +758,9 @@ def _get_embeddings_model() -> GoogleGenerativeAIEmbeddings:
 def build_vector_store(
     documents: List[Document],
     persist_directory: str | None = None,
+    *,
+    max_retries: int = 3,
+    retry_delay_seconds: float = 2.0,
 ) -> Chroma:
     """Create (or update) a Chroma vector store with Google embeddings from the documents."""
 
@@ -770,11 +778,30 @@ def build_vector_store(
     split_docs = splitter.split_documents(documents)
 
     directory = persist_directory or CHROMA_DIR
-    vector_store = Chroma.from_documents(
-        documents=split_docs,
-        embedding=embeddings,
-        persist_directory=directory,
-    )
+    attempt = 1
+    while True:
+        try:
+            vector_store = Chroma.from_documents(
+                documents=split_docs,
+                embedding=embeddings,
+                persist_directory=directory,
+            )
+            break
+        except GoogleGenerativeAIError as exc:  # pragma: no cover - depends on external service.
+            if attempt >= max_retries:
+                raise RuntimeError(
+                    "Google Generative AI failed to embed the documents after multiple retries. "
+                    "Please try again later or check the Gemini status page."
+                ) from exc
+
+            sleep_seconds = retry_delay_seconds * attempt
+            logger.warning(
+                "Google Generative AI returned an error while generating embeddings (attempt %s/%s). "
+                "Retrying in %.1f seconds...", attempt, max_retries, sleep_seconds
+            )
+            time.sleep(sleep_seconds)
+            attempt += 1
+
     vector_store.persist()
     return vector_store
 
