@@ -2,12 +2,26 @@
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
+import stat
 from pathlib import Path
 
 from dotenv import load_dotenv
 
 from main import CHROMA_DIR, PDF_FOLDER, build_vector_store, load_all_documents
+
+
+def _handle_remove_readonly(func, path, exc_info):
+    """Allow ``shutil.rmtree`` to delete read-only files on Windows."""
+
+    exc = exc_info[1]
+    if isinstance(exc, PermissionError):
+        os.chmod(path, os.stat(path).st_mode | stat.S_IWRITE)
+        func(path)
+        return
+
+    raise exc
 
 
 def generate_index(pdf_folder: str, chroma_dir: str, recreate: bool = True) -> None:
@@ -21,7 +35,7 @@ def generate_index(pdf_folder: str, chroma_dir: str, recreate: bool = True) -> N
 
     target_dir = Path(chroma_dir)
     if recreate and target_dir.exists():
-        shutil.rmtree(target_dir)
+        shutil.rmtree(target_dir, onerror=_handle_remove_readonly)
 
     target_dir.mkdir(parents=True, exist_ok=True)
 
