@@ -26,6 +26,7 @@ from langchain_core.documents import Document
 from langchain_core.prompts import PromptTemplate
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
+from langchain_community.vectorstores.utils import filter_complex_metadata
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 
 try:  # pragma: no cover - import path depends on package layout.
@@ -912,7 +913,7 @@ def build_vector_store(
 
     sanitized_docs: list[Document] = []
     for doc in split_docs:
-        sanitized_metadata: dict[str, str | int | float | bool | list[str | int | float | bool]] = {}
+        sanitized_metadata: dict[str, str | int | float | bool] = {}
         for key, value in (doc.metadata or {}).items():
             if value is None:
                 continue
@@ -936,21 +937,25 @@ def build_vector_store(
                     alts.extend(alt for alt in value if isinstance(alt, str))
 
                 if sources:
-                    sanitized_metadata["image_sources"] = sources
+                    sanitized_metadata["image_sources"] = json.dumps(sources)
                     if alts:
-                        sanitized_metadata["image_alts"] = alts
+                        sanitized_metadata["image_alts"] = json.dumps(alts)
                 continue
 
             if isinstance(value, (str, int, float, bool)):
                 sanitized_metadata[key] = value
             elif isinstance(value, list):
-                allowed_items = [item for item in value if isinstance(item, (str, int, float, bool))]
+                allowed_items = [
+                    item for item in value if isinstance(item, (str, int, float, bool))
+                ]
                 if allowed_items:
-                    sanitized_metadata[key] = allowed_items
+                    sanitized_metadata[key] = json.dumps(allowed_items)
 
         sanitized_docs.append(
             Document(page_content=doc.page_content, metadata=sanitized_metadata)
         )
+
+    sanitized_docs = filter_complex_metadata(sanitized_docs)
 
     directory = persist_directory or CHROMA_DIR
     attempt = 1
@@ -1007,12 +1012,30 @@ def _extract_images_from_metadata(metadata: dict) -> list[dict[str, str]]:
     if not metadata:
         return []
 
-    if isinstance(metadata.get("images"), list):
-        images_raw = metadata.get("images")
-    else:
+    images_raw = metadata.get("images")
+    if isinstance(images_raw, str):
+        try:
+            images_raw = json.loads(images_raw)
+        except json.JSONDecodeError:
+            images_raw = []
+
+    if not isinstance(images_raw, list):
         sources = metadata.get("image_sources") or []
         alts = metadata.get("image_alts") or []
         images_raw = []
+
+        if isinstance(sources, str):
+            try:
+                sources = json.loads(sources)
+            except json.JSONDecodeError:
+                sources = []
+
+        if isinstance(alts, str):
+            try:
+                alts = json.loads(alts)
+            except json.JSONDecodeError:
+                alts = []
+
         if isinstance(sources, list) and isinstance(alts, list):
             for index, src in enumerate(sources):
                 if not isinstance(src, str) or not src.strip():
