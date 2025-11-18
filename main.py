@@ -830,13 +830,34 @@ def load_halconet_documents(
             continue
 
         section = heading or _derive_section_from_url(page_url)
-        metadata: dict[str, str | None | list[dict[str, str | None]]] = {
+        metadata: dict[str, str | list[str]] = {
             "source": page_url,
-            "section": section,
             "origin": "halconet_docs",
         }
+        if section:
+            metadata["section"] = section
+
         if images:
-            metadata["images"] = images
+            image_sources: list[str] = []
+            image_alts: list[str] = []
+            normalized_images: list[dict[str, str]] = []
+            for image in images:
+                if not isinstance(image, dict):
+                    continue
+                src = image.get("src")
+                if not isinstance(src, str) or not src.strip():
+                    continue
+                alt = image.get("alt")
+                normalized_src = src.strip()
+                normalized_alt = alt.strip() if isinstance(alt, str) and alt.strip() else ""
+                image_sources.append(normalized_src)
+                image_alts.append(normalized_alt)
+                normalized_images.append({"src": normalized_src, "alt": normalized_alt})
+
+            if image_sources:
+                metadata["image_sources"] = image_sources
+                metadata["image_alts"] = image_alts
+                metadata["images"] = normalized_images
         documents.append(
             Document(
                 page_content=text,
@@ -889,12 +910,54 @@ def build_vector_store(
     # representa una idea más concreta.
     split_docs = splitter.split_documents(documents)
 
+    sanitized_docs: list[Document] = []
+    for doc in split_docs:
+        sanitized_metadata: dict[str, str | int | float | bool | list[str | int | float | bool]] = {}
+        for key, value in (doc.metadata or {}).items():
+            if value is None:
+                continue
+
+            if key in {"images", "image_sources", "image_alts"}:
+                sources: list[str] = []
+                alts: list[str] = []
+
+                if key == "images" and isinstance(value, list):
+                    for image in value:
+                        if not isinstance(image, dict):
+                            continue
+                        src = image.get("src")
+                        if isinstance(src, str) and src.strip():
+                            sources.append(src.strip())
+                            alt = image.get("alt")
+                            alts.append(alt.strip() if isinstance(alt, str) and alt.strip() else "")
+                elif key == "image_sources" and isinstance(value, list):
+                    sources.extend(src for src in value if isinstance(src, str) and src.strip())
+                elif key == "image_alts" and isinstance(value, list):
+                    alts.extend(alt for alt in value if isinstance(alt, str))
+
+                if sources:
+                    sanitized_metadata["image_sources"] = sources
+                    if alts:
+                        sanitized_metadata["image_alts"] = alts
+                continue
+
+            if isinstance(value, (str, int, float, bool)):
+                sanitized_metadata[key] = value
+            elif isinstance(value, list):
+                allowed_items = [item for item in value if isinstance(item, (str, int, float, bool))]
+                if allowed_items:
+                    sanitized_metadata[key] = allowed_items
+
+        sanitized_docs.append(
+            Document(page_content=doc.page_content, metadata=sanitized_metadata)
+        )
+
     directory = persist_directory or CHROMA_DIR
     attempt = 1
     while True:
         try:
             vector_store = Chroma.from_documents(
-                documents=split_docs,
+                documents=sanitized_docs,
                 embedding=embeddings,
                 persist_directory=directory,
             )
@@ -930,6 +993,45 @@ def load_vector_store(persist_directory: str | None = None) -> Chroma:
         )
 
     return Chroma(persist_directory=str(directory), embedding_function=embeddings)
+
+
+def _extract_images_from_metadata(metadata: dict) -> list[dict[str, str]]:
+    """Return a normalized list of image dictionaries from metadata.
+
+    Chroma solo admite metadatos con tipos primitivos. Durante la indexación
+    guardamos las imágenes en dos listas (`image_sources` e `image_alts`). Esta
+    función reconstruye la estructura original esperada por el cliente y también
+    admite el formato previo en el que `images` ya era una lista de diccionarios.
+    """
+
+    if not metadata:
+        return []
+
+    if isinstance(metadata.get("images"), list):
+        images_raw = metadata.get("images")
+    else:
+        sources = metadata.get("image_sources") or []
+        alts = metadata.get("image_alts") or []
+        images_raw = []
+        if isinstance(sources, list) and isinstance(alts, list):
+            for index, src in enumerate(sources):
+                if not isinstance(src, str) or not src.strip():
+                    continue
+                alt = alts[index] if index < len(alts) else ""
+                images_raw.append({"src": src.strip(), "alt": alt if isinstance(alt, str) else ""})
+
+    images: list[dict[str, str]] = []
+    if isinstance(images_raw, list):
+        for image in images_raw:
+            if not isinstance(image, dict):
+                continue
+            src = image.get("src")
+            if not isinstance(src, str) or not src.strip():
+                continue
+            alt = image.get("alt")
+            images.append({"src": src.strip(), "alt": alt.strip() if isinstance(alt, str) else ""})
+
+    return images
 
 
 def initialize_qa_chain() -> RetrievalQA:
@@ -1436,9 +1538,7 @@ async def ask_question(payload: AskRequest) -> AskResponse:
         snippet_image_lines: list[str] = []
         snippet_seen_images: set[str] = set()
 
-        for image in metadata.get("images") or []:
-            if not isinstance(image, dict):
-                continue
+        for image in _extract_images_from_metadata(metadata):
             src = image.get("src")
             if not isinstance(src, str) or not src.strip():
                 continue
