@@ -227,6 +227,7 @@ def test_ask_question_deduplicates_sources(test_client):
         "Source: file2.pdf (page 2)\ncontent B",
     ]
     assert data["conversation_id"] == "default"
+    assert data["images"] == []
 
 
 def test_conversation_history_is_tracked_per_user(test_client):
@@ -288,6 +289,39 @@ def test_follow_up_question_uses_chat_history(test_client):
     chain.handler = None
 
 
+def test_ask_includes_image_references(test_client):
+    chain = main._dummy_chain  # type: ignore[attr-defined]
+
+    def handler(query):
+        return {
+            "result": "respuesta",
+            "source_documents": [
+                DummyDoc(
+                    "contenido",
+                    {
+                        "source": "file1.pdf",
+                        "images": [
+                            {"src": "https://docs.halconet.com/img/uno.png", "alt": "primera"},
+                            {"src": "https://docs.halconet.com/img/uno.png", "alt": "duplicada"},
+                        ],
+                    },
+                )
+            ],
+        }
+
+    chain.handler = handler
+
+    response = test_client.post("/ask", json={"question": "Imagen?", "user_id": "u1"})
+    assert response.status_code == 200
+
+    data = response.json()
+    assert data["images"] == [
+        {"src": "https://docs.halconet.com/img/uno.png", "alt": "primera"}
+    ]
+
+    chain.handler = None
+
+
 class _DummyResponse:
     def __init__(self, text: str, status_code: int = 200):
         self.text = text
@@ -319,7 +353,12 @@ def test_load_halconet_documents_parses_pages():
         "<url><loc>https://docs.halconet.com/intro</loc></url>"
         "</urlset>"
     )
-    html = "<html><body><h1>Bienvenida</h1><p>Contenido principal.</p></body></html>"
+    html = (
+        "<html><body><h1>Bienvenida</h1>"
+        "<p>Contenido principal.</p>"
+        "<img src='/assets/fig.png' alt='Diagrama'/>"
+        "</body></html>"
+    )
     session = _DummySession(sitemap, html)
 
     documents = main.load_halconet_documents(base_url="https://docs.halconet.com", session=session)
@@ -329,6 +368,9 @@ def test_load_halconet_documents_parses_pages():
     assert doc.metadata["source"] == "https://docs.halconet.com/intro"
     assert "Contenido principal" in doc.page_content
     assert doc.metadata["section"] in {"Bienvenida", "Intro"}
+    assert doc.metadata["images"] == [
+        {"src": "https://docs.halconet.com/assets/fig.png", "alt": "Diagrama"}
+    ]
 
 
 def test_load_halconet_documents_handles_errors():
