@@ -1433,12 +1433,8 @@ async def ask_question(payload: AskRequest) -> AskResponse:
             dedupe_key = (source, page)
             page_display = page
 
-        # ``seen_sources`` recuerda qué combinaciones ya se han agregado para no
-        # devolver el mismo fragmento varias veces al cliente.
-        if dedupe_key not in seen_sources:
-            seen_sources.add(dedupe_key)
-            snippet = f"Source: {source} (page {page_display})\n{page_content}"
-            context_snippets.append(snippet)
+        snippet_image_lines: list[str] = []
+        snippet_seen_images: set[str] = set()
 
         for image in metadata.get("images") or []:
             if not isinstance(image, dict):
@@ -1447,12 +1443,29 @@ async def ask_question(payload: AskRequest) -> AskResponse:
             if not isinstance(src, str) or not src.strip():
                 continue
             normalized_src = src.strip()
-            if normalized_src in seen_images:
-                continue
-            seen_images.add(normalized_src)
-            alt = image.get("alt")
-            alt_text = alt if isinstance(alt, str) and alt.strip() else None
-            image_references.append(ImageReference(src=normalized_src, alt=alt_text))
+            if normalized_src not in snippet_seen_images:
+                snippet_seen_images.add(normalized_src)
+                alt_raw = image.get("alt")
+                alt_text = alt_raw.strip() if isinstance(alt_raw, str) and alt_raw.strip() else None
+                image_line = f"Image: {normalized_src}"
+                if alt_text:
+                    image_line += f" (alt: {alt_text})"
+                snippet_image_lines.append(image_line)
+
+            if normalized_src not in seen_images:
+                seen_images.add(normalized_src)
+                alt = image.get("alt")
+                alt_text = alt if isinstance(alt, str) and alt.strip() else None
+                image_references.append(ImageReference(src=normalized_src, alt=alt_text))
+
+        # ``seen_sources`` recuerda qué combinaciones ya se han agregado para no
+        # devolver el mismo fragmento varias veces al cliente.
+        if dedupe_key not in seen_sources:
+            seen_sources.add(dedupe_key)
+            snippet = f"Source: {source} (page {page_display})\n{page_content}"
+            if snippet_image_lines:
+                snippet += "\n" + "\n".join(snippet_image_lines)
+            context_snippets.append(snippet)
 
     # Actualiza el historial almacenando la nueva pareja pregunta/respuesta en
     # el backend compartido. ``append_turn`` usa operaciones atómicas (RPUSH +

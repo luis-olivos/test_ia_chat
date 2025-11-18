@@ -300,6 +300,7 @@ def test_ask_includes_image_references(test_client):
                     "contenido",
                     {
                         "source": "file1.pdf",
+                        "page": 1,
                         "images": [
                             {"src": "https://docs.halconet.com/img/uno.png", "alt": "primera"},
                             {"src": "https://docs.halconet.com/img/uno.png", "alt": "duplicada"},
@@ -315,6 +316,9 @@ def test_ask_includes_image_references(test_client):
     assert response.status_code == 200
 
     data = response.json()
+    assert data["context"] == [
+        "Source: file1.pdf (page 1)\ncontenido\nImage: https://docs.halconet.com/img/uno.png (alt: primera)"
+    ]
     assert data["images"] == [
         {"src": "https://docs.halconet.com/img/uno.png", "alt": "primera"}
     ]
