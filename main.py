@@ -828,7 +828,24 @@ def load_halconet_documents(
             page_response.text, base_url=page_url
         )
         if not text:
-            continue
+            # Algunas páginas pueden contener únicamente imágenes (por ejemplo,
+            # logotipos en la cabecera). En esos casos conservamos el documento
+            # para que el cliente reciba las referencias visuales, utilizando
+            # el encabezado o los textos alternativos como contenido mínimo.
+            fallback_parts: list[str] = []
+            if heading:
+                fallback_parts.append(heading)
+            for image in images or []:
+                if not isinstance(image, dict):
+                    continue
+                alt = image.get("alt")
+                if isinstance(alt, str) and alt.strip():
+                    fallback_parts.append(alt.strip())
+
+            text = " ".join(fallback_parts).strip()
+
+            if not text:
+                continue
 
         section = heading or _derive_section_from_url(page_url)
         metadata: dict[str, str | list[str]] = {

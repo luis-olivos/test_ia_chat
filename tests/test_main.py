@@ -63,6 +63,7 @@ def _install_stub_modules() -> None:
     # langchain_community.vectorstores
     langchain_community = ModuleType("langchain_community")
     langchain_community_vectorstores = ModuleType("langchain_community.vectorstores")
+    langchain_community_vectorstores_utils = ModuleType("langchain_community.vectorstores.utils")
 
     class _Chroma:
         def __init__(self, *args, **kwargs):
@@ -76,8 +77,15 @@ def _install_stub_modules() -> None:
             return self
 
     langchain_community_vectorstores.Chroma = _Chroma
+
+    def _filter_complex_metadata(documents):
+        return documents
+
+    langchain_community_vectorstores_utils.filter_complex_metadata = _filter_complex_metadata
+
     sys.modules["langchain_community"] = langchain_community
     sys.modules["langchain_community.vectorstores"] = langchain_community_vectorstores
+    sys.modules["langchain_community.vectorstores.utils"] = langchain_community_vectorstores_utils
 
     # langchain_google_genai
     langchain_google_genai = ModuleType("langchain_google_genai")
@@ -374,6 +382,33 @@ def test_load_halconet_documents_parses_pages():
     assert doc.metadata["section"] in {"Bienvenida", "Intro"}
     assert doc.metadata["images"] == [
         {"src": "https://docs.halconet.com/assets/fig.png", "alt": "Diagrama"}
+    ]
+
+
+def test_load_halconet_documents_keeps_image_only_pages():
+    sitemap = (
+        "<?xml version='1.0' encoding='UTF-8'?>"
+        "<urlset xmlns='http://www.sitemaps.org/schemas/sitemap/0.9'>"
+        "<url><loc>https://docs.halconet.com/manuales</loc></url>"
+        "</urlset>"
+    )
+    html = (
+        "<html><body>"
+        "<img src='https://docs.halconet.com/wp-content/uploads/2025/11/grupo-tractozone-logo-transparente-e1762967904237.png' alt='Manuales Grupo Tractozone'/>"
+        "</body></html>"
+    )
+    session = _DummySession(sitemap, html)
+
+    documents = main.load_halconet_documents(base_url="https://docs.halconet.com", session=session)
+
+    assert len(documents) == 1
+    doc = documents[0]
+    assert doc.page_content != ""
+    assert doc.metadata["images"] == [
+        {
+            "src": "https://docs.halconet.com/wp-content/uploads/2025/11/grupo-tractozone-logo-transparente-e1762967904237.png",
+            "alt": "Manuales Grupo Tractozone",
+        }
     ]
 
 
