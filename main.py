@@ -18,7 +18,7 @@ from urllib.parse import urljoin, urlparse
 from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.concurrency import run_in_threadpool
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 import requests
 from langchain_classic.chains import RetrievalQA
@@ -329,7 +329,7 @@ class InMemoryConversationStore:
         self._storage.clear()
 
 
-CachedResponse = Tuple[str, List[str], List[dict[str, str | None]]]
+CachedResponse = Tuple[str, List[str]]
 
 
 class ResponseCache(Protocol):
@@ -381,23 +381,12 @@ class RedisResponseCache:
 
         answer = data.get("answer")
         context = data.get("context")
-        images = data.get("images", [])
-        if not isinstance(answer, str) or not isinstance(context, list) or not isinstance(images, list):
+        if not isinstance(answer, str) or not isinstance(context, list):
             logger.warning("Formato inesperado en la caché para %s", key)
             return None
 
         sanitized_context = [str(item) for item in context]
-        sanitized_images: list[dict[str, str | None]] = []
-        for entry in images:
-            if not isinstance(entry, dict):
-                continue
-            src = entry.get("src")
-            if not isinstance(src, str) or not src.strip():
-                continue
-            alt = entry.get("alt") if isinstance(entry.get("alt"), str) else None
-            sanitized_images.append({"src": src.strip(), "alt": alt})
-
-        return answer, sanitized_context, sanitized_images
+        return answer, sanitized_context
 
     def set(
         self,
@@ -405,11 +394,10 @@ class RedisResponseCache:
         normalized_question: str,
         answer: str,
         context: List[str],
-        images: List[dict[str, str | None]],
     ) -> None:
         key = self._build_key(user_id, normalized_question)
         payload = json.dumps(
-            {"answer": answer, "context": context, "images": images}, ensure_ascii=False
+            {"answer": answer, "context": context}, ensure_ascii=False
         )
         try:
             self._client.setex(key, self._ttl_seconds, payload)
@@ -471,13 +459,6 @@ class AskRequest(BaseModel):
     conversation_id: str | None = None
 
 
-class ImageReference(BaseModel):
-    """Representa una imagen relevante para la respuesta."""
-
-    src: str
-    alt: str | None = None
-
-
 class AskResponse(BaseModel):
     """Schema for responses returned by POST /ask."""
 
@@ -490,8 +471,6 @@ class AskResponse(BaseModel):
     # Identificador de conversación efectivo que se utilizó para almacenar el
     # historial. El cliente puede conservarlo para futuras solicitudes.
     conversation_id: str
-    # Referencias a imágenes relacionadas con los documentos recuperados.
-    images: List[ImageReference] = Field(default_factory=list)
 
 
 def load_pdf_documents(pdf_dir: str) -> List[Document]:
@@ -854,21 +833,6 @@ def load_halconet_documents(
         if section:
             metadata["section"] = section
 
-        if images:
-            normalized_images: list[dict[str, str]] = []
-            for image in images:
-                if not isinstance(image, dict):
-                    continue
-                src = image.get("src")
-                alt = image.get("alt")
-                if not isinstance(src, str) or not src.strip():
-                    continue
-                normalized_images.append(
-                    {"src": src.strip(), "alt": alt.strip() if isinstance(alt, str) else ""}
-                )
-
-            if normalized_images:
-                metadata["images"] = normalized_images
         documents.append(
             Document(
                 page_content=text,
@@ -1008,54 +972,6 @@ def load_vector_store(persist_directory: str | None = None) -> Chroma:
         )
 
     return Chroma(persist_directory=str(directory), embedding_function=embeddings)
-
-
-def _extract_images_from_metadata(metadata: dict) -> list[dict[str, str | None]]:
-    """Return a normalized list of image dictionaries from metadata."""
-
-    if not metadata:
-        return []
-
-    images_raw = metadata.get("images")
-    if isinstance(images_raw, str):
-        try:
-            images_raw = json.loads(images_raw)
-        except json.JSONDecodeError:
-            images_raw = []
-
-    if not isinstance(images_raw, list):
-        sources = metadata.get("image_sources") or []
-        alts = metadata.get("image_alts") or []
-        images_raw = []
-
-        if isinstance(sources, str):
-            try:
-                sources = json.loads(sources)
-            except json.JSONDecodeError:
-                sources = []
-
-        if isinstance(alts, str):
-            try:
-                alts = json.loads(alts)
-            except json.JSONDecodeError:
-                alts = []
-
-        if isinstance(sources, list):
-            for index, src in enumerate(sources):
-                alt = alts[index] if isinstance(alts, list) and index < len(alts) else None
-                images_raw.append({"src": src, "alt": alt})
-
-    images: list[dict[str, str | None]] = []
-    if isinstance(images_raw, list):
-        for image in images_raw:
-            if not isinstance(image, dict):
-                continue
-            src = image.get("src")
-            alt = image.get("alt")
-            if isinstance(src, str) and src.strip():
-                images.append({"src": src.strip(), "alt": alt.strip() if isinstance(alt, str) else None})
-
-    return images
 
 
 def initialize_qa_chain() -> RetrievalQA:
@@ -1474,7 +1390,7 @@ async def ask_question(payload: AskRequest) -> AskResponse:
             logger.warning("No se pudo consultar la caché de respuestas: %s", exc)
 
     if cached_entry is not None:
-        answer, cached_context, cached_images = cached_entry
+        answer, cached_context = cached_entry
         try:
             await run_in_threadpool(
                 conversation_store.append_turn,
@@ -1491,7 +1407,6 @@ async def ask_question(payload: AskRequest) -> AskResponse:
             answer=answer,
             context=cached_context,
             conversation_id=conversation_id,
-            images=[ImageReference(**image) for image in cached_images],
         )
 
     try:
@@ -1530,9 +1445,7 @@ async def ask_question(payload: AskRequest) -> AskResponse:
     # ``context_snippets`` almacenará los textos que se devolverán al cliente
     # como referencia, evitando repeticiones mediante ``seen_sources``.
     context_snippets = []
-    image_references: list[ImageReference] = []
     seen_sources = set()
-    seen_images = set()
     for doc in source_docs:
         metadata = doc.metadata or {}
         source = metadata.get("source", "unknown source")
@@ -1560,35 +1473,11 @@ async def ask_question(payload: AskRequest) -> AskResponse:
             page_display = page
 
 
-        snippet_seen_images = set()
-        snippet_image_lines: list[str] = []
-        for image in _extract_images_from_metadata(metadata):
-            src = image.get("src")
-            if not isinstance(src, str) or not src.strip():
-                continue
-            normalized_src = src.strip()
-            if normalized_src not in snippet_seen_images:
-                snippet_seen_images.add(normalized_src)
-                alt_raw = image.get("alt")
-                alt_text = alt_raw.strip() if isinstance(alt_raw, str) and alt_raw.strip() else None
-                image_line = f"Image: {normalized_src}"
-                if alt_text:
-                    image_line += f" (alt: {alt_text})"
-                snippet_image_lines.append(image_line)
-
-            if normalized_src not in seen_images:
-                seen_images.add(normalized_src)
-                alt = image.get("alt")
-                alt_text = alt if isinstance(alt, str) and alt.strip() else None
-                image_references.append(ImageReference(src=normalized_src, alt=alt_text))
-
         # ``seen_sources`` recuerda qué combinaciones ya se han agregado para no
         # devolver el mismo fragmento varias veces al cliente.
         if dedupe_key not in seen_sources:
             seen_sources.add(dedupe_key)
             snippet = f"Source: {source} (page {page_display})\n{page_content}"
-            if snippet_image_lines:
-                snippet += "\n" + "\n".join(snippet_image_lines)
             context_snippets.append(snippet)
 
     # Actualiza el historial almacenando la nueva pareja pregunta/respuesta en
@@ -1614,7 +1503,6 @@ async def ask_question(payload: AskRequest) -> AskResponse:
                 normalized_question,
                 answer,
                 context_snippets,
-                [image.dict() for image in image_references],
             )
         except ResponseCacheError as exc:
             logger.warning("No se pudo guardar la respuesta en caché: %s", exc)
@@ -1623,7 +1511,6 @@ async def ask_question(payload: AskRequest) -> AskResponse:
         answer=answer,
         context=context_snippets,
         conversation_id=conversation_id,
-        images=image_references,
     )
 
 

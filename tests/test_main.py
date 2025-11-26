@@ -235,7 +235,6 @@ def test_ask_question_deduplicates_sources(test_client):
         "Source: file2.pdf (page 2)\ncontent B",
     ]
     assert data["conversation_id"] == "default"
-    assert data["images"] == []
 
 
 def test_conversation_history_is_tracked_per_user(test_client):
@@ -324,12 +323,7 @@ def test_ask_includes_image_references(test_client):
     assert response.status_code == 200
 
     data = response.json()
-    assert data["context"] == [
-        "Source: file1.pdf (page 1)\ncontenido\nImage: https://docs.halconet.com/img/uno.png (alt: primera)"
-    ]
-    assert data["images"] == [
-        {"src": "https://docs.halconet.com/img/uno.png", "alt": "primera"}
-    ]
+    assert data["context"] == ["Source: file1.pdf (page 1)\ncontenido"]
 
     chain.handler = None
 
@@ -380,9 +374,7 @@ def test_load_halconet_documents_parses_pages():
     assert doc.metadata["source"] == "https://docs.halconet.com/intro"
     assert "Contenido principal" in doc.page_content
     assert doc.metadata["section"] in {"Bienvenida", "Intro"}
-    assert doc.metadata["images"] == [
-        {"src": "https://docs.halconet.com/assets/fig.png", "alt": "Diagrama"}
-    ]
+    assert "images" not in doc.metadata
 
 
 def test_load_halconet_documents_keeps_image_only_pages():
@@ -404,12 +396,7 @@ def test_load_halconet_documents_keeps_image_only_pages():
     assert len(documents) == 1
     doc = documents[0]
     assert doc.page_content != ""
-    assert doc.metadata["images"] == [
-        {
-            "src": "https://docs.halconet.com/wp-content/uploads/2025/11/grupo-tractozone-logo-transparente-e1762967904237.png",
-            "alt": "Manuales Grupo Tractozone",
-        }
-    ]
+    assert "images" not in doc.metadata
 
 
 def test_load_halconet_documents_handles_errors():
