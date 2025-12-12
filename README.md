@@ -19,6 +19,17 @@ pip install -r requirements.txt
 
 A continuación crea un archivo `.env` en la raíz del proyecto (o exporta las variables en tu shell) con la configuración necesaria antes de iniciar la aplicación.
 
+### Ejemplo mínimo de `.env`
+
+```env
+GOOGLE_API_KEY=tu_clave_de_gemini
+PDF_FOLDER=pdfs
+CHROMA_DIR=chroma_store
+REDIS_URL=redis://localhost:6379/0
+```
+
+Puedes agregar al mismo archivo el resto de variables de la tabla siguiente si necesitas valores personalizados.
+
 ## Preparar los documentos y el índice
 
 1. Coloca tus archivos PDF en la carpeta indicada por `PDF_FOLDER` (por defecto `pdfs/`).
@@ -49,6 +60,13 @@ Si omites este paso, la API construirá el índice automáticamente durante el a
 
 Consulta `main.py` para más variables avanzadas relacionadas con reintentos y backoff.
 
+## Estructura de proyecto
+
+- `main.py`: aplicación FastAPI y puntos de entrada.
+- `offline_index.py`: utilitario para generar o actualizar el índice de embeddings.
+- `pdfs/`: carpeta por defecto donde se almacenan los documentos a indexar.
+- `tests/`: pruebas automatizadas con `pytest`.
+
 ## Ejecutar la API
 
 Con el entorno virtual activo y las variables configuradas, inicia el servidor con Uvicorn:
@@ -58,6 +76,8 @@ uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
 La opción `--reload` es útil en desarrollo porque recarga la aplicación al detectar cambios en el código. En producción se recomienda ejecutar Uvicorn o Gunicorn sin recarga automática y detrás de un proxy inverso.
+
+Si ejecutas el servidor dentro de un contenedor, expón el puerto configurado (`8000` por defecto) y monta un volumen persistente en `CHROMA_DIR` para conservar el índice entre reinicios.
 
 ## Endpoints disponibles
 
@@ -112,6 +132,16 @@ Expone métricas en formato Prometheus/OpenTelemetry, incluyendo latencias del r
 
 - **Historiales**: cada vez que se recibe una pregunta, la API recupera las interacciones previas desde Redis, resume el contexto y lo envía junto con la nueva consulta. Esto permite respuestas coherentes en conversaciones prolongadas.
 - **Caché de respuestas**: si `QA_CACHE_TTL_SECONDS` está configurada, las respuestas se almacenan temporalmente y se reutilizan para preguntas repetidas del mismo usuario. Esto reduce el costo de invocación al modelo y mejora la latencia.
+
+## Pruebas automatizadas
+
+Ejecuta la suite de pruebas con `pytest` desde la raíz del proyecto:
+
+```bash
+pytest
+```
+
+Si necesitas comprobar únicamente un archivo o prueba específica, puedes usar `pytest tests/test_nombre.py -k nombre_de_la_prueba`.
 
 ## Buenas prácticas para despliegue
 
