@@ -8,3 +8,4 @@ pydantic
 redis
 prometheus-client
 requests
+python-3.11.9
