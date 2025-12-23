@@ -1,7 +1,10 @@
 fastapi
 uvicorn
 langchain
+langchain-classic
 langchain-google-genai
+langchain-community
+langchain-text-splitters
 chromadb
 PyPDF2
 pydantic
