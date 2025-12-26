@@ -963,14 +963,24 @@ def build_vector_store(
 def load_vector_store(persist_directory: str | None = None) -> Chroma:
     """Open the existing Chroma store previously generated offline."""
 
-    embeddings = _get_embeddings_model()
-
     directory = Path(persist_directory or CHROMA_DIR)
     if not directory.exists() or not any(directory.iterdir()):
-        raise RuntimeError(
-            f"Chroma directory '{directory}' is missing or empty. Run the offline indexing pipeline first."
+        logger.warning(
+            "Chroma directory '%s' is missing or empty. Building a fresh index from '%s'.",
+            directory,
+            PDF_FOLDER,
         )
 
+        documents = load_all_documents(PDF_FOLDER)
+        if not documents:
+            raise RuntimeError(
+                f"No PDF documents found in '{PDF_FOLDER}'. Add PDFs before generating the index."
+            )
+
+        directory.mkdir(parents=True, exist_ok=True)
+        return build_vector_store(documents, persist_directory=str(directory))
+
+    embeddings = _get_embeddings_model()
     return Chroma(persist_directory=str(directory), embedding_function=embeddings)
 
 
