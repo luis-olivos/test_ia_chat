@@ -1029,7 +1029,10 @@ def initialize_qa_chain() -> RetrievalQA:
                 - La ruta del menú.
                 - La respuesta.
                 - Los pasos.
-
+            
+            **SECCION DE APOYO**
+            Nota: esta seccion solo tiene la finalidad de complementar los puntos anteriores, y no debe ser incluida como parte de la esctructura final.
+            
             Ruta del menú:
             (Indica la ruta exacta. Si no la conoces por el contexto, omite esta sección).
 
@@ -1038,6 +1041,7 @@ def initialize_qa_chain() -> RetrievalQA:
 
             Pasos:
             (Lista numerada breve).
+            ** FIN DE LA SECCION DE APOYO **
 
             ⚠️ REGLAS DE ORO
             1. PROHIBIDO incluir fuentes de información (ej. "Fuente: Google Chat", "Según el documento").
@@ -1045,6 +1049,7 @@ def initialize_qa_chain() -> RetrievalQA:
             3. No inventes rutas. Si no está en el contexto, simplemente no pongas la sección "Ruta del menú".
             4. Usa un lenguaje para administrativos con conocimientos básicos.
             5. No uses formato HTML ni referencias técnicas.
+            6. Si la pregunta del usuario es confusa, puedes solicitarlle que la reformule o pedirle mas información.
 
             👋 SALUDOS
             Si el usuario solo saluda, responde: "¡Hola, Halcoamigo! ¿En qué puedo ayudarte hoy?" y termina ahí. No uses la estructura de arriba para saludos.
@@ -1482,27 +1487,12 @@ async def ask_question(payload: AskRequest) -> AskResponse:
     # de modificar el prompt global (lo que provocaba condiciones de carrera
     # bajo carga). Si la optimización falla por cualquier motivo, se recurre al
     # flujo estándar de ``qa_chain`` como mecanismo de respaldo.
-    try:
-        result = await run_in_threadpool(
-            _execute_qa_chain,
-            payload.question,
-            chat_history,
-            chat_history_text,
-        )
-    except (
-        RuntimeError,
-        TimeoutError,
-        FuturesTimeoutError,
-        GoogleGenerativeAIError,
-    ) as exc:
-        logger.error("Fallo en la cadena de QA o sus dependencias: %s", exc)
-        raise HTTPException(
-            status_code=503,
-            detail="QA system failed to process the request.",
-        ) from exc
-    except Exception:
-        logger.exception("Error inesperado al ejecutar la cadena de QA")
-        raise
+    result = await run_in_threadpool(
+        _execute_qa_chain,
+        payload.question,
+        chat_history,
+        chat_history_text,
+    )
     answer = result.get("result", "No answer generated.")
 
     source_docs = result.get("source_documents", [])
