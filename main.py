@@ -675,6 +675,15 @@ def load_halconet_documents(
             candidate_paths.append(fallback)
 
     http_session = session or requests.Session()
+    # 🔧 FIX PROD (CDN + Brotli): evita que el servidor responda con "br"
+    # porque requests no siempre puede descomprimir brotli en algunos contenedores.
+    http_session.headers.update({
+        "User-Agent": "Mozilla/5.0 (compatible; HalcoNET-Indexer/1.0; +https://halconet.com)",
+        "Accept": "application/xml,text/xml;q=0.9,*/*;q=0.8",
+        "Accept-Encoding": "identity",  # <- clave para que el XML llegue parseable
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    })
     timeout = HALCONET_DOCS_TIMEOUT_SECONDS or 10.0
 
     sitemap_text: str | None = None
@@ -695,6 +704,13 @@ def load_halconet_documents(
         if raw_urls:
             sitemap_text = candidate_text
             break
+        else:
+            # 👀 Debug útil en PROD
+            ct = sitemap_response.headers.get("Content-Type", "")
+            logger.warning(
+                "Sitemap descargado pero no parseable. url=%s content-type=%s head=%r",
+                candidate_url, ct, candidate_text[:200]
+            )
 
     if sitemap_text is None:
         logger.warning(
