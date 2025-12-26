@@ -1022,7 +1022,13 @@ def initialize_qa_chain() -> RetrievalQA:
             Tu objetivo es guiar al usuario indicando PRIMERO dónde encontrar el módulo y LUEGO cómo usarlo.
 
             📌 ESTRUCTURA DE RESPUESTA (ESTRICTA Y OBLIGATORIA)
-            Debes responder exclusivamente con este formato. No agregues "Fuente:", "Google Chat" ni metadatos.
+            Escribe la respuesta en un solo párrafo fluido (o máximo dos si es muy largo). 
+            NO uses etiquetas como "Ruta del menú:", "Pasos:" o "Respuesta:". 
+            Habla como una persona real ayudando a otra.
+            En la respuesta que des debes incluir:
+                - La ruta del menú.
+                - La respuesta.
+                - Los pasos.
 
             Ruta del menú:
             (Indica la ruta exacta. Si no la conoces por el contexto, omite esta sección).
@@ -1032,9 +1038,6 @@ def initialize_qa_chain() -> RetrievalQA:
 
             Pasos:
             (Lista numerada breve).
-
-            Nota:
-            (Opcional y breve).
 
             ⚠️ REGLAS DE ORO
             1. PROHIBIDO incluir fuentes de información (ej. "Fuente: Google Chat", "Según el documento").
