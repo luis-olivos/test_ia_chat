@@ -1050,6 +1050,7 @@ def initialize_qa_chain() -> RetrievalQA:
         partial_variables={"chat_history_text": "(sin historial previo)"},
     )
 
+
     # Build a retriever from the vector store to be consumed by LangChain's RetrievalQA chain.
     # Un "retriever" se encarga de buscar los fragmentos más relevantes dentro
     # del índice vectorial dado un texto de consulta.
