@@ -1479,12 +1479,27 @@ async def ask_question(payload: AskRequest) -> AskResponse:
     # de modificar el prompt global (lo que provocaba condiciones de carrera
     # bajo carga). Si la optimización falla por cualquier motivo, se recurre al
     # flujo estándar de ``qa_chain`` como mecanismo de respaldo.
-    result = await run_in_threadpool(
-        _execute_qa_chain,
-        payload.question,
-        chat_history,
-        chat_history_text,
-    )
+    try:
+        result = await run_in_threadpool(
+            _execute_qa_chain,
+            payload.question,
+            chat_history,
+            chat_history_text,
+        )
+    except (
+        RuntimeError,
+        TimeoutError,
+        FuturesTimeoutError,
+        GoogleGenerativeAIError,
+    ) as exc:
+        logger.error("Fallo en la cadena de QA o sus dependencias: %s", exc)
+        raise HTTPException(
+            status_code=503,
+            detail="QA system failed to process the request.",
+        ) from exc
+    except Exception:
+        logger.exception("Error inesperado al ejecutar la cadena de QA")
+        raise
     answer = result.get("result", "No answer generated.")
 
     source_docs = result.get("source_documents", [])
